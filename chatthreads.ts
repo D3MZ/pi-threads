@@ -12,7 +12,7 @@ const childSlots = slots.slice(1);
 const directory = join(getAgentDir(), "chatthreads");
 const configPath = join(directory, "config.json");
 const extensionPath = fileURLToPath(import.meta.url);
-const defaults = { targets: "ctrl+;", prefix: "ctrl", previous: "ctrl+shift+left", next: "ctrl+shift+right", newThread: "ctrl+n" };
+const defaults = { targets: "ctrl+;", prefix: "ctrl", previous: "ctrl+shift+left", next: "ctrl+shift+right", newThread: "ctrl+n", mainThread: "ctrl+shift+1" };
 type Config = typeof defaults;
 type Thread = { slot: string; session: string; title: string; pid?: number; tty?: string; terminalId?: string; parent?: string; entry?: string; reservedAt?: number; kind?: "rpc" | "tui"; kickoff?: string };
 type Group = { version: 1; root: string; threads: Thread[] };
@@ -24,16 +24,22 @@ function loadConfig(): Config {
   try {
     const saved = JSON.parse(readFileSync(configPath, "utf8"));
     const config = Object.fromEntries(Object.entries(defaults).map(([k, v]) => [k, typeof saved[k] === "string" ? saved[k].toLowerCase().trim() : v])) as Config;
-    // An older configuration may already use Ctrl+N for another action.
-    if (typeof saved.newThread !== "string" && !uniqueShortcuts(config)) {
-      for (const candidate of ["ctrl+shift+n", "ctrl+alt+n", "alt+n", "super+n"]) {
-        config.newThread = candidate;
-        if (uniqueShortcuts(config)) break;
-      }
+    // Preserve older bindings when a newly introduced default overlaps one.
+    const used = [config.targets, config.previous, config.next, ...[...slots].map(s => `${config.prefix}+${s}`)].map(shortcutSignature);
+    for (const name of ["newThread", "mainThread"] as const) {
+      if (typeof saved[name] === "string") used.push(shortcutSignature(config[name]));
+    }
+    for (const [name, candidates] of [
+      ["newThread", ["ctrl+n", "ctrl+shift+n", "ctrl+alt+n", "alt+n", "super+n"]],
+      ["mainThread", ["ctrl+shift+1", "ctrl+alt+1", "alt+1", "ctrl+alt+shift+1", "ctrl+super+1", "super+1"]],
+    ] as const) {
+      if (typeof saved[name] === "string") continue;
+      config[name] = candidates.find(v => !used.includes(shortcutSignature(v))) || config[name];
+      used.push(shortcutSignature(config[name]));
     }
     const prefix = /^(?:(?:ctrl|alt|shift|super)\+)*(?:ctrl|alt|shift|super)$/;
     const key = /^(?:(?:ctrl|alt|shift|super)\+)+(?:[a-z0-9;]|left|right|up|down|f(?:[1-9]|1[0-2]))$/;
-    return prefix.test(config.prefix) && [config.targets, config.previous, config.next, config.newThread].every(v => key.test(v)) && uniqueShortcuts(config) ? config : { ...defaults };
+    return prefix.test(config.prefix) && [config.targets, config.previous, config.next, config.newThread, config.mainThread].every(v => key.test(v)) && uniqueShortcuts(config) ? config : { ...defaults };
   } catch { return { ...defaults }; }
 }
 function shortcutSignature(key: string) {
@@ -42,7 +48,7 @@ function shortcutSignature(key: string) {
   return `${[...new Set(parts)].sort().join("+")}+${name}`;
 }
 function uniqueShortcuts(config: Config) {
-  const keys = [config.targets, config.previous, config.next, config.newThread, ...[...slots].map(s => `${config.prefix}+${s}`)].map(shortcutSignature);
+  const keys = [config.targets, config.previous, config.next, config.newThread, config.mainThread, ...[...slots].map(s => `${config.prefix}+${s}`)].map(shortcutSignature);
   return new Set(keys).size === keys.length;
 }
 function ensureDir() { mkdirSync(directory, { recursive: true, mode: 0o700 }); }
@@ -268,7 +274,7 @@ export default function (pi: ExtensionAPI) {
           const list = (group?.threads || []).sort((a, b) => slots.indexOf(a.slot) - slots.indexOf(b.slot));
           const threads = list.map(t => t.session === selectedSession ? `[${t.slot}]` : t.slot).join(" ");
           return [
-            truncateToWidth(theme.fg("accent", `↳ ${config.prefix}+number: select or switch · ctrl+esc to close this thread · ${config.newThread}: fork latest`), width),
+            truncateToWidth(theme.fg("accent", `↳ ${config.prefix}+number: select or switch · ${config.mainThread}: main · ctrl+esc to close this thread · ${config.newThread}: fork latest`), width),
             truncateToWidth(theme.fg("dim", `  Threads: ${threads}`), width),
           ];
         },
@@ -599,13 +605,13 @@ export default function (pi: ExtensionAPI) {
     finally { creating = false; }
   }
   async function settings(ctx: ExtensionContext) {
-    const choices = ["Target shortcut", "Thread modifier prefix", "Previous thread shortcut", "Next thread shortcut", "New thread shortcut", "Restore defaults"];
+    const choices = ["Target shortcut", "Thread modifier prefix", "Previous thread shortcut", "Next thread shortcut", "New thread shortcut", "Main thread shortcut", "Restore defaults"];
     const picked = await ctx.ui.select("Thread keybindings", choices);
     if (!picked) return;
     let nextConfig: Config;
-    if (picked === choices[5]) nextConfig = { ...defaults };
+    if (picked === choices[6]) nextConfig = { ...defaults };
     else {
-      const key = (["targets", "prefix", "previous", "next", "newThread"] as const)[choices.indexOf(picked)];
+      const key = (["targets", "prefix", "previous", "next", "newThread", "mainThread"] as const)[choices.indexOf(picked)];
       const value = await ctx.ui.input(`${picked} (current: ${config[key]})`, config[key]);
       if (value === undefined) return;
       const v = value.trim().toLowerCase();
@@ -684,6 +690,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (matchesKey(data, config.previous as any)) { void cycle(ctx, -1); return { consume: true }; }
       if (matchesKey(data, config.next as any)) { void cycle(ctx, 1); return { consume: true }; }
+      if (matchesKey(data, config.mainThread as any)) { void choose(ctx, "1"); return { consume: true }; }
       // Ctrl+N also filters Pi's session picker. Handle this shortcut only
       // in the editor instead of registering a conflicting global shortcut.
       if (matchesKey(data, config.newThread as any)) {
@@ -793,4 +800,5 @@ export default function (pi: ExtensionAPI) {
   for (const slot of slots) pi.registerShortcut(`${config.prefix}+${slot}` as any, { description: `Open chat thread ${slot}`, handler: ctx => choose(ctx, slot) });
   pi.registerShortcut(config.previous as any, { description: "Previous chat thread", handler: ctx => cycle(ctx, -1) });
   pi.registerShortcut(config.next as any, { description: "Next chat thread", handler: ctx => cycle(ctx, 1) });
+  pi.registerShortcut(config.mainThread as any, { description: "Return to the main chat thread", handler: ctx => choose(ctx, "1") });
 }
