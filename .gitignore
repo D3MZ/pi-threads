@@ -1,0 +1,22 @@
+# Dependencies and generated output
+node_modules/
+dist/
+build/
+coverage/
+.nyc_output/
+*.tsbuildinfo
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.template
+.npmrc
+.pi/
+
+# Logs and editor/OS files
+*.log
+.DS_Store
+.idea/
+*.swp
+*.swo
