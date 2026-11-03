@@ -1,5 +1,5 @@
 # pi-threads
-Threaded side conversations that fork the existing chat at any point you choose that operates async.
+Threaded side conversations that fork the existing chat at any point you choose that operates async. Tested with Ghostty, should work with Kitty's protocol, but may need to rebind (i.e. cmux)
 1. Hold down Ctrl + number to fork at that point
 2. Close thread with Ctrl + Esc
 3. Enjoy.
