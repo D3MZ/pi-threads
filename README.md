@@ -1,7 +1,7 @@
 # pi-threads
 Threaded side conversations that fork the existing chat at any point you choose that operates async.
-1. Hold down ctrl + number to fork at that point
-2. Closing a fork with Control+Esc frees its number and leaves its file untouched.
+1. Hold down Ctrl + number to fork at that point
+2. Close thread with Ctrl + Esc
 3. Enjoy.
 
 ## Installation

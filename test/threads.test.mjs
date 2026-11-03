@@ -193,7 +193,7 @@ test("thread commands work in Pi, including cancelling a pending reply and switc
     let index = output.length;
     pty.write("/threads ");
     const suggestions = await waitFor(since(index), text => ["on", "off", "show", "keybinding"].every(item => text.includes(item)), "subcommand suggestions");
-    assert.doesNotMatch(suggestions, /\bforget\b/);
+    assert.doesNotMatch(suggestions, /\bforget\b|reply <number>/);
     pty.write("\x1b"); // Close autocomplete, then clear the editor.
     await sleep(150);
     pty.write("\x15");
@@ -216,7 +216,14 @@ test("thread commands work in Pi, including cancelling a pending reply and switc
     // Running on twice must not turn the numbered view off.
     await submit("/threads on");
     await sleep(200);
-    await send("/threads reply 3", text => text.includes("Replying to 3"), "pending reply");
+    const removedTarget = await send("/threads reply 3", text => text.includes("Use /threads on, off, show, keybinding"), "removed reply command for a target");
+    assert.doesNotMatch(removedTarget, /Replying to 3/);
+    const removedSwitch = await send("/threads reply 2", text => text.includes("Use /threads on, off, show, keybinding"), "removed reply command for a registered thread");
+    assert.doesNotMatch(removedSwitch, /FORK_SESSION_MARKER/);
+    assert.deepEqual(JSON.parse(readFileSync(registry, "utf8")).threads.map(thread => thread.slot), ["1", "2"]);
+    index = output.length;
+    pty.write("\x1b[51;5u"); // Ctrl+3 selects the visible message.
+    await waitFor(since(index), text => text.includes("Replying to 3"), "keyboard-selected reply");
     // Type normally so completion is exercised while a reply is pending.
     index = output.length;
     pty.write("/threads o");
@@ -225,7 +232,11 @@ test("thread commands work in Pi, including cancelling a pending reply and switc
     await sleep(300);
     pty.write("\r"); // A fully typed command should run with one Enter.
     await sleep(250);
-    await send("/threads reply 3", text => text.includes("Run /threads on first"), "off clears pending reply and numbered view");
+    await send("/threads reply 3", text => text.includes("Use /threads on, off, show, keybinding"), "reply command remains unavailable with targets hidden");
+    await send("/threads on", text => text.includes("Threads:") && text.includes("[1]"), "off cancels the pending reply and allows targets to reopen");
+    const unregistered = await send("/threads 3", text => text.includes("Thread 3 is unavailable"), "an unregistered target cannot be opened by command");
+    assert.doesNotMatch(unregistered, /Replying to 3/);
+    await submit("/threads off");
     assert.deepEqual(JSON.parse(readFileSync(registry, "utf8")).threads.map(thread => thread.slot), ["1", "2"]);
     await send("/threads show", text => text.includes("Chat threads") && text.includes("Fork test"), "thread selector");
     pty.write("\x1b");
@@ -236,6 +247,74 @@ test("thread commands work in Pi, including cancelling a pending reply and switc
     await send("/threads forget 2", text => text.includes("Use /threads on, off, show, keybinding"), "removed forget command");
     assert.deepEqual(JSON.parse(readFileSync(registry, "utf8")).threads.map(thread => thread.slot), ["1", "2"]);
     await send("/threads nonsense", text => text.includes("Use /threads on, off, show, keybinding"), "invalid command usage");
+  } finally {
+    try { pty.kill("SIGTERM"); } catch {}
+    const timer = setTimeout(() => { try { pty.kill("SIGKILL"); } catch {} }, 5000);
+    timer.unref();
+    await exited;
+    clearTimeout(timer);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Ctrl+number creates a fork and switches to an existing thread", { timeout: 60000 }, async () => {
+  const { dir, agent, env } = fixture();
+  const main = join(dir, "main.jsonl");
+  const registry = join(agent, "chatthreads", `${createHash("sha256").update(main).digest("hex")}.json`);
+  const pty = spawn(pi, [...flags, "--provider", "threads-test", "--model", "mock", "--tui-mode", "fullscreen", "--session", main, "-e", extension, "-e", mockProvider], { name: "xterm-256color", cols: 120, rows: 35, cwd: root, env });
+  let output = "";
+  pty.onData(data => { output += data; });
+  const exited = new Promise(resolve => pty.onExit(resolve));
+  const since = index => () => output.slice(index);
+  const group = () => JSON.parse(readFileSync(registry, "utf8"));
+  const messages = path => readFileSync(path, "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(entry => entry.type === "message");
+  const textOf = entry => Array.isArray(entry.message.content) ? entry.message.content.map(part => part.text || "").join("") : entry.message.content;
+  async function submit(text) {
+    pty.write(`\x1b[200~${text}\x1b[201~`);
+    await sleep(100);
+    pty.write("\r");
+  }
+  try {
+    await waitFor(() => output, text => text.includes("MOCK_READY_MARKER"), "Pi startup");
+    let index = output.length;
+    await submit("MAIN_CONTEXT_MARKER");
+    await waitFor(since(index), text => text.includes("MOCK_RESPONSE_MARKER"), "main response");
+
+    index = output.length;
+    pty.write("\x1b[57441;5u"); // Hold Ctrl to show targets.
+    await waitFor(since(index), text => text.includes("Threads:") && text.includes("2 ›"), "numbered target");
+    index = output.length;
+    pty.write("\x1b[50;5u"); // Ctrl+2 selects the target.
+    await waitFor(since(index), text => text.includes("Replying to 2"), "keyboard-selected target");
+    pty.write("\x1b[57441;1:3u"); // Release Ctrl before typing.
+
+    index = output.length;
+    await submit("FORK_REPLY_MARKER");
+    await waitFor(since(index), text => {
+      try {
+        const fork = group().threads.find(thread => thread.slot === "2");
+        if (!fork || !text.includes("FORK_REPLY_MARKER")) return false;
+        const entries = messages(fork.session);
+        return entries.some(entry => entry.message.role === "user" && textOf(entry) === "FORK_REPLY_MARKER")
+          && entries.filter(entry => entry.message.role === "assistant" && textOf(entry) === "MOCK_RESPONSE_MARKER").length === 2;
+      } catch { return false; }
+    }, "fork reply and response");
+    const fork = group().threads.find(thread => thread.slot === "2");
+    assert.equal(fork.parent, main);
+    assert(messages(fork.session).some(entry => entry.message.role === "user" && textOf(entry) === "MAIN_CONTEXT_MARKER"));
+    assert(!messages(main).some(entry => textOf(entry) === "FORK_REPLY_MARKER"));
+
+    index = output.length;
+    await submit("/threads 1");
+    await waitFor(since(index), text => text.includes("MAIN_CONTEXT_MARKER"), "return to main");
+    index = output.length;
+    pty.write("\x1b[57441;5u");
+    await waitFor(since(index), text => text.includes("Threads:") && text.includes("2"), "thread preview");
+    index = output.length;
+    pty.write("\x1b[50;5u"); // The registered number now switches instead of creating another fork.
+    await waitFor(since(index), text => text.includes("FORK_REPLY_MARKER"), "switch to existing thread");
+    pty.write("\x1b[57441;1:3u");
+    assert.deepEqual(group().threads.map(thread => thread.slot), ["1", "2"]);
   } finally {
     try { pty.kill("SIGTERM"); } catch {}
     const timer = setTimeout(() => { try { pty.kill("SIGKILL"); } catch {} }, 5000);

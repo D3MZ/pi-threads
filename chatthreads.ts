@@ -719,37 +719,29 @@ export default function (pi: ExtensionAPI) {
     description: "Manage threads: on, off, show, keybinding",
     getArgumentCompletions: (prefix) => {
       const group = groupFile && readGroup(groupFile);
-      const numbered = /^reply\s+/.test(prefix);
-      const options = numbered
-        ? [...targets.values()].map(t => ({ value: `reply ${t.slot}`, label: `reply ${t.slot}`, description: t.title }))
-        : [
-          { value: "on", label: "on", description: "Show message numbers" },
-          { value: "off", label: "off", description: "Hide numbers and cancel a pending reply" },
-          { value: "show", label: "show", description: "Choose an existing thread" },
-          { value: "keybinding", label: "keybinding", description: "Configure shortcuts" },
-          { value: "reply", label: "reply <number>", description: "Reply to a numbered message" },
-          ...(group?.threads || []).map(t => ({ value: t.slot, label: t.slot, description: `Switch to ${t.title}` })),
-        ];
+      const options = [
+        { value: "on", label: "on", description: "Show message numbers" },
+        { value: "off", label: "off", description: "Hide numbers and cancel a pending reply" },
+        { value: "show", label: "show", description: "Choose an existing thread" },
+        { value: "keybinding", label: "keybinding", description: "Configure shortcuts" },
+        ...(group?.threads || []).map(t => ({ value: t.slot, label: t.slot, description: `Switch to ${t.title}` })),
+      ];
       const matches = options.filter(option => option.value.startsWith(prefix));
       // Once a complete command is typed, Enter should run it instead of accepting it again.
-      if (matches.some(option => option.value === prefix) && prefix !== "reply") return null;
+      if (matches.some(option => option.value === prefix)) return null;
       return matches.length ? matches : null;
     },
     handler: async (args, ctx) => {
       if (ctx.mode !== "tui") return;
       const command = args.trim();
-      const reply = /^reply\s+([0-9])$/.exec(command);
       if (command === "keybinding") await settings(ctx);
       else if (command === "show") await listThreads(ctx);
       else if (command === "on") await enableTargets(ctx);
       else if (command === "off") {
         if (creating) ctx.ui.notify("The new thread is starting", "warning");
         else { pending = undefined; hideTargets(); }
-      } else if (reply) {
-        if (!targetMode) ctx.ui.notify("Run /threads on first to show message numbers", "info");
-        else await choose(ctx, reply[1]);
       } else if (/^[0-9]$/.test(command)) await focusSlot(ctx, command);
-      else ctx.ui.notify("Use /threads on, off, show, keybinding, <number>, or reply <number>", command ? "warning" : "info");
+      else ctx.ui.notify("Use /threads on, off, show, keybinding, or <number>", command ? "warning" : "info");
     },
   });
   pi.registerShortcut(config.targets as any, { description: "Show visible chat thread targets", handler: toggleTargets });
