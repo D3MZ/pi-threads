@@ -12,7 +12,7 @@ const childSlots = slots.slice(1);
 const directory = join(getAgentDir(), "chatthreads");
 const configPath = join(directory, "config.json");
 const extensionPath = fileURLToPath(import.meta.url);
-const defaults = { targets: "ctrl+;", prefix: "ctrl", previous: "ctrl+shift+left", next: "ctrl+shift+right" };
+const defaults = { targets: "ctrl+;", prefix: "ctrl", previous: "ctrl+shift+left", next: "ctrl+shift+right", newThread: "ctrl+n" };
 type Config = typeof defaults;
 type Thread = { slot: string; session: string; title: string; pid?: number; tty?: string; terminalId?: string; parent?: string; entry?: string; reservedAt?: number; kind?: "rpc" | "tui"; kickoff?: string };
 type Group = { version: 1; root: string; threads: Thread[] };
@@ -24,9 +24,16 @@ function loadConfig(): Config {
   try {
     const saved = JSON.parse(readFileSync(configPath, "utf8"));
     const config = Object.fromEntries(Object.entries(defaults).map(([k, v]) => [k, typeof saved[k] === "string" ? saved[k].toLowerCase().trim() : v])) as Config;
+    // An older configuration may already use Ctrl+N for another action.
+    if (typeof saved.newThread !== "string" && !uniqueShortcuts(config)) {
+      for (const candidate of ["ctrl+shift+n", "ctrl+alt+n", "alt+n", "super+n"]) {
+        config.newThread = candidate;
+        if (uniqueShortcuts(config)) break;
+      }
+    }
     const prefix = /^(?:(?:ctrl|alt|shift|super)\+)*(?:ctrl|alt|shift|super)$/;
     const key = /^(?:(?:ctrl|alt|shift|super)\+)+(?:[a-z0-9;]|left|right|up|down|f(?:[1-9]|1[0-2]))$/;
-    return prefix.test(config.prefix) && [config.targets, config.previous, config.next].every(v => key.test(v)) && uniqueShortcuts(config) ? config : { ...defaults };
+    return prefix.test(config.prefix) && [config.targets, config.previous, config.next, config.newThread].every(v => key.test(v)) && uniqueShortcuts(config) ? config : { ...defaults };
   } catch { return { ...defaults }; }
 }
 function shortcutSignature(key: string) {
@@ -35,7 +42,7 @@ function shortcutSignature(key: string) {
   return `${[...new Set(parts)].sort().join("+")}+${name}`;
 }
 function uniqueShortcuts(config: Config) {
-  const keys = [config.targets, config.previous, config.next, ...[...slots].map(s => `${config.prefix}+${s}`)].map(shortcutSignature);
+  const keys = [config.targets, config.previous, config.next, config.newThread, ...[...slots].map(s => `${config.prefix}+${s}`)].map(shortcutSignature);
   return new Set(keys).size === keys.length;
 }
 function ensureDir() { mkdirSync(directory, { recursive: true, mode: 0o700 }); }
@@ -261,7 +268,7 @@ export default function (pi: ExtensionAPI) {
           const list = (group?.threads || []).sort((a, b) => slots.indexOf(a.slot) - slots.indexOf(b.slot));
           const threads = list.map(t => t.session === selectedSession ? `[${t.slot}]` : t.slot).join(" ");
           return [
-            truncateToWidth(theme.fg("accent", `↳ ${config.prefix}+number: select or switch · ctrl+esc to close this thread · scroll for more`), width),
+            truncateToWidth(theme.fg("accent", `↳ ${config.prefix}+number: select or switch · ctrl+esc to close this thread · ${config.newThread}: fork latest`), width),
             truncateToWidth(theme.fg("dim", `  Threads: ${threads}`), width),
           ];
         },
@@ -536,42 +543,69 @@ export default function (pi: ExtensionAPI) {
     pending = target;
     refreshMode();
   }
-  async function createThread(ctx: ExtensionContext, target: Target, message: Reply) {
+  async function createThread(ctx: ExtensionContext, target?: Target, message?: Reply) {
     const session = ctx.sessionManager.getSessionFile();
     if (!session || !groupFile) throw new Error("Thread parent is no longer available");
     const path = groupFile;
+    let selected = target;
     let child = "";
-    let kickoff = "";
     try {
       await locked(path, group => {
         if (!group) throw new Error("Thread registry disappeared");
-        const existing = group.threads.find(t => t.parent === session && t.entry === target.entry);
-        if (existing) throw new Error(`A thread for this message already exists in slot ${existing.slot}`);
-        if (group.threads.some(t => t.slot === target.slot)) throw new Error(`Slot ${target.slot} was taken; select the message again`);
         const activeBranch = ctx.sessionManager.getBranch() as Entry[];
-        const index = activeBranch.findIndex(e => e.id === target.entry);
-        const boundary = index < 0 ? undefined : safeBoundary(activeBranch, index);
-        if (!boundary || boundary !== target.boundary) throw new Error("The selected message is no longer on this branch; select it again");
-        child = SessionManager.open(session).createBranchedSession(boundary) || "";
+        if (target) {
+          const existing = group.threads.find(t => t.parent === session && t.entry === target.entry);
+          if (existing) throw new Error(`A thread for this message already exists in slot ${existing.slot}`);
+          if (group.threads.some(t => t.slot === target.slot)) throw new Error(`Slot ${target.slot} was taken; select the message again`);
+          const index = activeBranch.findIndex(e => e.id === target.entry);
+          const boundary = index < 0 ? undefined : safeBoundary(activeBranch, index);
+          if (!boundary || boundary !== target.boundary) throw new Error("The selected message is no longer on this branch; select it again");
+        } else {
+          const slot = [...childSlots].find(s => !group.threads.some(t => t.slot === s));
+          if (!slot) throw new Error("All thread slots are in use");
+          const entry = [...activeBranch].reverse().find(e =>
+            (e.type === "message" && e.message.role !== "system") || (e.type === "custom_message" && e.display) || e.type === "compaction" || e.type === "branch_summary");
+          if (!entry) throw new Error("There is no message to fork yet");
+          // Include trailing branch metadata, but never fork with outstanding tool calls.
+          const boundary = safeBoundary(activeBranch, activeBranch.length - 1);
+          if (!boundary) throw new Error("Wait for the current tool calls to finish before forking");
+          selected = { entry: entry.id, boundary, title: titleFor(entry), slot };
+        }
+        const fork = selected!;
+        child = SessionManager.open(session).createBranchedSession(fork.boundary) || "";
         if (!child || !existsSync(child)) throw new Error("Could not save the forked session");
-        kickoff = join(directory, `kickoff-${randomUUID()}.json`);
-        writeFileSync(kickoff, JSON.stringify({ session: child, message }), { mode: 0o600, flag: "wx" });
-        group.threads.push({ slot: target.slot, session: child, parent: session, entry: target.entry, title: target.title.slice(0, 35), kickoff });
+        let kickoff: string | undefined;
+        if (message !== undefined) {
+          kickoff = join(directory, `kickoff-${randomUUID()}.json`);
+          writeFileSync(kickoff, JSON.stringify({ session: child, message }), { mode: 0o600, flag: "wx" });
+        }
+        group.threads.push({ slot: fork.slot, session: child, parent: session, entry: fork.entry, title: fork.title.slice(0, 35), ...(kickoff ? { kickoff } : {}) });
         writeGroup(path, group);
       });
-      await switchSlot(ctx, target.slot);
+      await switchSlot(ctx, selected!.slot);
     } catch (e) {
-      throw new Error(`${errorText(e)}${child ? `; fork and reply saved at ${child}` : ""}`);
+      throw new Error(`${errorText(e)}${child ? `; fork${message !== undefined ? " and reply" : ""} saved at ${child}` : ""}`);
     }
   }
+  async function forkLatest(ctx: ExtensionContext) {
+    if (ctx.mode !== "tui") return;
+    if (pending || creating) { ctx.ui.notify("Finish your reply or run /threads off first", "info"); return; }
+    suppressHold = held; hideTargets();
+    creating = true;
+    try {
+      if (!groupFile) await registerMe(ctx, true);
+      await createThread(ctx);
+    } catch (e) { notifyThreadFailure(ctx, e, "Could not open thread"); }
+    finally { creating = false; }
+  }
   async function settings(ctx: ExtensionContext) {
-    const choices = ["Target shortcut", "Thread modifier prefix", "Previous thread shortcut", "Next thread shortcut", "Restore defaults"];
+    const choices = ["Target shortcut", "Thread modifier prefix", "Previous thread shortcut", "Next thread shortcut", "New thread shortcut", "Restore defaults"];
     const picked = await ctx.ui.select("Thread keybindings", choices);
     if (!picked) return;
     let nextConfig: Config;
-    if (picked === choices[4]) nextConfig = { ...defaults };
+    if (picked === choices[5]) nextConfig = { ...defaults };
     else {
-      const key = (["targets", "prefix", "previous", "next"] as const)[choices.indexOf(picked)];
+      const key = (["targets", "prefix", "previous", "next", "newThread"] as const)[choices.indexOf(picked)];
       const value = await ctx.ui.input(`${picked} (current: ${config[key]})`, config[key]);
       if (value === undefined) return;
       const v = value.trim().toLowerCase();
@@ -650,6 +684,17 @@ export default function (pi: ExtensionAPI) {
       }
       if (matchesKey(data, config.previous as any)) { void cycle(ctx, -1); return { consume: true }; }
       if (matchesKey(data, config.next as any)) { void cycle(ctx, 1); return { consume: true }; }
+      // Ctrl+N also filters Pi's session picker. Handle this shortcut only
+      // in the editor instead of registering a conflicting global shortcut.
+      if (matchesKey(data, config.newThread as any)) {
+        const focused = ui?.getFocusedComponent();
+        const inEditor = focused && focused === ui?.children?.[4]?.children?.[0]
+          && typeof focused.getText === "function" && typeof focused.setText === "function";
+        if (inEditor) {
+          if (!key || key.event === 1) void forkLatest(ctx);
+          return { consume: true };
+        }
+      }
       if (key && (key.text !== undefined || data !== raw)) return { data: key.text ?? data };
     });
     const session = ctx.sessionManager.getSessionFile();
