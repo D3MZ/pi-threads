@@ -6,7 +6,15 @@ Threaded side conversations that fork the existing chat at any point you choose 
 
 ## Thread activity
 
-Hold **Ctrl** to see the thread selector: working threads pulse, completed threads with unread activity stay white, and other threads are dim. Brackets mark the current thread; press **Ctrl + number** to switch.
+Hold **Ctrl** to bring up the thread selector.
+
+Threads can show three states:
+
+1. **Pulsing:** Working
+2. **White:** Unread
+3. **Grey:** Idle, with no unread activity
+
+The current thread is shown in brackets, like `[1]`.
 
 ![Thread selector showing working and unread activity](assets/thread-activity.gif)
 
