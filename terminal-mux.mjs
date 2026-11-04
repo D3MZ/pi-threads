@@ -174,8 +174,8 @@ export class TerminalMux {
     this.children.delete(currentSession); child.socket?.destroy();
     child.rejectReady(new Error(`Pi thread exited (${event.signal || event.exitCode})`));
     const wasActive = this.active === child;
-    if (wasActive) this.showMain();
-    this.onExit?.(currentSession, child.pty.pid, wasActive, child.unpersistedHeader);
+    const handled = this.onExit?.(currentSession, child.pty.pid, wasActive, child.unpersistedHeader);
+    if (wasActive && handled !== true) this.showMain();
   }
   async show(child) {
     if (!this.inputWrapper) {

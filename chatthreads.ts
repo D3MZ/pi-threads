@@ -11,13 +11,12 @@ import { fileURLToPath } from "node:url";
 
 const slots = "1234567890";
 const tapDurationMs = 300;
-const childSlots = slots.slice(1);
 const directory = join(getAgentDir(), "chatthreads");
 const configPath = join(directory, "config.json");
 const extensionPath = fileURLToPath(import.meta.url);
 const defaults = { targets: "ctrl+;", prefix: "ctrl", previous: "ctrl+shift+left", next: "ctrl+shift+right", newThread: "ctrl+n", mainThread: "ctrl+shift+1" };
 type Config = typeof defaults;
-type Thread = { slot: string; session: string; title: string; pid?: number; tty?: string; terminalId?: string; parent?: string; entry?: string; reservedAt?: number; kind?: "rpc" | "tui"; kickoff?: string; working?: boolean; unread?: boolean; initialModel?: { provider: string; id: string; thinking: string } };
+type Thread = { slot: string; session: string; title: string; pid?: number; tty?: string; terminalId?: string; parent?: string; entry?: string; reservedAt?: number; kind?: "rpc" | "tui"; kickoff?: string; working?: boolean; unread?: boolean; closed?: boolean; initialModel?: { provider: string; id: string; thinking: string } };
 type Group = { version: 1; root: string; threads: Thread[]; viewing?: string };
 type Target = { entry: string; boundary: string; title: string; slot: string };
 type TreePreview = (width: number, theme: ExtensionContext["ui"]["theme"]) => string[];
@@ -64,6 +63,7 @@ function readGroup(path: string): Group | undefined {
     if (g.version === 1 && typeof g.root === "string" && Array.isArray(g.threads)) return g;
   } catch { /* absent or malformed */ }
 }
+function visibleThreads(group?: Group): Thread[] { return (group?.threads || []).filter(thread => !thread.closed); }
 function writeGroup(path: string, group: Group) {
   ensureDir();
   const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
@@ -244,6 +244,7 @@ export default async function (pi: ExtensionAPI) {
   let pending: PendingTarget | undefined;
   let creating = false;
   let closing: string | undefined;
+  let recovering = false;
   let footerPatch: { container: any; original: Function; replacement: Function } | undefined;
   let footerSlots: ThreadIndicator[] = [];
   let footerSignature = "";
@@ -279,8 +280,8 @@ export default async function (pi: ExtensionAPI) {
   }
   function refreshFooterSlots() {
     const group = groupFile && readGroup(groupFile);
-    const list = (group?.threads || []).slice().sort((a, b) => slots.indexOf(a.slot) - slots.indexOf(b.slot));
-    const next: ThreadIndicator[] = list.length
+    const list = visibleThreads(group).sort((a, b) => slots.indexOf(a.slot) - slots.indexOf(b.slot));
+    const next: ThreadIndicator[] = group
       ? list.map(t => ({ slot: t.slot, current: t.session === selectedSession, working: t.working === true && pidAlive(t.pid), unread: t.unread === true }))
       : childSocket ? [] : [{ slot: "1", current: true, working: localWorking, unread: false }];
     locallyVisible = group ? group.viewing === context?.sessionManager.getSessionFile() : !childSocket && terminalFocused && !mux?.active;
@@ -296,7 +297,7 @@ export default async function (pi: ExtensionAPI) {
       if (groupFile !== path) return;
       await locked(path, group => {
         if (!group) return;
-        const viewed = group.threads.find(thread => thread.session === viewing);
+        const viewed = visibleThreads(group).find(thread => thread.session === viewing);
         if (group.viewing === viewed?.session && !viewed?.unread) return;
         if (viewed) { group.viewing = viewed.session; delete viewed.unread; }
         else delete group.viewing;
@@ -314,7 +315,7 @@ export default async function (pi: ExtensionAPI) {
     try {
       await locked(path, group => {
         const me = group?.threads.find(thread => thread.session === session && thread.pid === process.pid);
-        if (!group || !me) return;
+        if (!group || !me || me.closed) return;
         if (working) me.working = true;
         else {
           delete me.working;
@@ -394,10 +395,15 @@ export default async function (pi: ExtensionAPI) {
       if (!me && create && group.root === session) { me = { slot: "1", session, title: "Main" }; group.threads.unshift(me); }
       if (!me) throw new Error("This thread is no longer registered");
       if (me.pid && me.pid !== process.pid && pidAlive(me.pid)) throw new Error("This session is already open in another thread process");
+      if (me.closed && !childSocket && group.root === session && me.pid !== process.pid) {
+        const slot = [...slots].find(value => !visibleThreads(group).some(thread => thread.slot === value));
+        if (!slot) throw new Error("All thread slots are in use");
+        me.slot = slot; delete me.closed;
+      }
       me.pid = process.pid; delete me.tty; delete me.terminalId; delete me.reservedAt;
       if (localWorking) me.working = true; else delete me.working;
       if (!childSocket) {
-        const viewed = terminalFocused && group.threads.find(thread => thread.session === selectedSession);
+        const viewed = terminalFocused && visibleThreads(group).find(thread => thread.session === selectedSession);
         if (viewed) { group.viewing = viewed.session; delete viewed.unread; }
         else delete group.viewing;
       }
@@ -406,8 +412,14 @@ export default async function (pi: ExtensionAPI) {
     groupFile = path;
     refreshFooterSlots();
   }
+  function hostClosed(ctx: ExtensionContext) {
+    const group = groupFile && readGroup(groupFile);
+    return group?.threads.some(thread => thread.session === ctx.sessionManager.getSessionFile() && thread.closed) === true;
+  }
   function getMux(ctx: ExtensionContext) {
     const onSwitch = async (slot: string) => {
+      if (closing) throw new Error("A thread is closing; please wait");
+      if (slot === "reopen-host") { await reopenHost(ctx); return; }
       if (slot.startsWith("close:")) {
         const child = mux?.active;
         if (!child || slot !== `close:${child.token}`) throw new Error("This thread is no longer active");
@@ -434,7 +446,17 @@ export default async function (pi: ExtensionAPI) {
           delete entry.pid; delete entry.reservedAt; delete entry.working; writeGroup(path, group);
         }
       }).catch(() => {});
-      if (active) { selectedSession = ctx.sessionManager.getSessionFile(); updateViewing(); refreshMode(); }
+      if (active) {
+        if (hostClosed(ctx)) {
+          const exited = mux?.active;
+          if (!closing) setImmediate(() => {
+            if (mux?.active === exited && !closing) void focusRemaining(ctx, session);
+          });
+          return true;
+        }
+        selectedSession = ctx.sessionManager.getSessionFile(); updateViewing(); refreshMode();
+      }
+      return false;
     };
     const getAppearance = () => ctx.ui.theme.appearance;
     const isFocused = () => terminalFocused;
@@ -536,15 +558,60 @@ export default async function (pi: ExtensionAPI) {
     if (thread.session === ctx.sessionManager.getSessionFile()) {
       selectedSession = thread.session; mux?.showMain(); updateViewing(); refreshMode(); return;
     }
+    const previous = mux?.active;
     const child = await ensureTerminal(ctx, thread);
     if (request !== focusGeneration) return;
+    const manager = getMux(ctx);
     selectedSession = thread.session;
     updateViewing();
-    try { await getMux(ctx).show(child); }
+    try { await manager.show(child); }
     catch (e) {
       if (request !== focusGeneration) return;
-      getMux(ctx).showMain(); selectedSession = ctx.sessionManager.getSessionFile(); updateViewing(); refreshMode(); throw e;
+      if (hostClosed(ctx)) {
+        if (previous && previous !== child && manager.children.get(previous.session) === previous) {
+          selectedSession = previous.session; updateViewing(); refreshMode();
+          try { await manager.show(previous); } catch { if (!closing && !recovering) void focusRemaining(ctx, thread.session); }
+        } else if (!closing && !recovering) void focusRemaining(ctx, thread.session);
+      } else {
+        manager.showMain(); selectedSession = ctx.sessionManager.getSessionFile(); updateViewing(); refreshMode();
+      }
+      throw e;
     }
+  }
+  async function reopenHost(ctx: ExtensionContext) {
+    const path = groupFile, session = ctx.sessionManager.getSessionFile();
+    if (!path || !session) throw new Error("The thread manager is unavailable");
+    const slot = await locked(path, group => {
+      const host = group?.threads.find(thread => thread.session === session);
+      if (!group || group.root !== session || !host) throw new Error("The original session is unavailable");
+      if (!host.closed) return host.slot;
+      const free = [...slots].find(value => !visibleThreads(group).some(thread => thread.slot === value));
+      if (!free) throw new Error("All thread slots are in use");
+      host.slot = free; delete host.closed;
+      if (!ctx.isIdle()) host.working = true;
+      writeGroup(path, group);
+      return free;
+    });
+    await switchSlot(ctx, slot);
+  }
+  async function focusRemaining(ctx: ExtensionContext, excluded: string) {
+    if (recovering || closing) return;
+    recovering = true;
+    try {
+      const group = groupFile && readGroup(groupFile);
+      const candidates = visibleThreads(group).filter(thread => thread.session !== excluded).reverse();
+      if (!candidates.length) { ctx.abort(); ctx.shutdown(); return; }
+      let failure: unknown;
+      for (const thread of candidates) {
+        try {
+          await switchSlot(ctx, thread.slot);
+          return;
+        } catch (e) { failure = e; }
+      }
+      try { await reopenHost(ctx); }
+      catch { mux?.showMain(); selectedSession = ctx.sessionManager.getSessionFile(); updateViewing(); refreshMode(); }
+      ctx.ui.notify(`Could not switch to a remaining thread: ${errorText(failure)}`, "error");
+    } finally { recovering = false; }
   }
   async function focusSlot(ctx: ExtensionContext, slot: string) {
     try { await switchSlot(ctx, slot); }
@@ -552,7 +619,7 @@ export default async function (pi: ExtensionAPI) {
   }
   async function cycle(ctx: ExtensionContext, direction: number) {
     const group = groupFile && readGroup(groupFile);
-    const list = (group?.threads || []).slice().sort((a, b) => slots.indexOf(a.slot) - slots.indexOf(b.slot));
+    const list = visibleThreads(group).sort((a, b) => slots.indexOf(a.slot) - slots.indexOf(b.slot));
     const i = list.findIndex(t => t.session === selectedSession);
     if (i >= 0 && list.length > 1) await focusSlot(ctx, list[(i + direction + list.length) % list.length].slot);
   }
@@ -560,11 +627,61 @@ export default async function (pi: ExtensionAPI) {
     try {
       if (!groupFile) await registerMe(ctx, true);
       const group = groupFile && readGroup(groupFile);
-      const list = (group?.threads || []).slice().sort((a, b) => slots.indexOf(a.slot) - slots.indexOf(b.slot));
+      const list = visibleThreads(group).sort((a, b) => slots.indexOf(a.slot) - slots.indexOf(b.slot));
       const options = list.map(t => `${t.slot}  ${t.title}${t.session === selectedSession ? "  (current)" : ""}`);
       const selected = await ctx.ui.select("Chat threads", options);
       if (selected) await focusSlot(ctx, list[options.indexOf(selected)].slot);
     } catch (e) { notifyThreadFailure(ctx, e, "Chat threads"); }
+  }
+  function stopHostWork(ctx: ExtensionContext) {
+    ctx.abort();
+    // ctx.abort() stops the agent, but Pi's interactive shell has its own
+    // Escape handler. Invoke it on the host editor, not the visible child PTY.
+    const cancelShell = () => {
+      const editor = ui?.children?.[4]?.children?.[0];
+      if (typeof editor?.onEscape !== "function" || typeof editor.getText !== "function" || typeof editor.setText !== "function") return;
+      const text = editor.getText();
+      if (!text.trim()) editor.setText("\u200b");
+      try { editor.onEscape(); }
+      finally { if (editor.getText() !== text) editor.setText(text); }
+    };
+    if (ctx.isIdle()) cancelShell();
+    else {
+      const deadline = Date.now() + 10000;
+      const timer = setInterval(() => {
+        if (context !== ctx || Date.now() >= deadline || (!closing && !hostClosed(ctx))) { clearInterval(timer); return; }
+        if (ctx.isIdle()) { clearInterval(timer); cancelShell(); }
+      }, 50);
+      timer.unref();
+    }
+  }
+  async function closeHost(ctx: ExtensionContext) {
+    if (closing) return;
+    const session = ctx.sessionManager.getSessionFile();
+    const path = groupFile;
+    const group = path && readGroup(path);
+    const others = visibleThreads(group).filter(thread => thread.session !== session);
+    if (!others.length) { stopHostWork(ctx); ctx.shutdown(); return; }
+    if (!path || !session) throw new Error("The current thread is unavailable");
+    closing = session;
+    try {
+      const next = [...others].reverse().find(thread => existsSync(thread.session) || mux?.children.has(thread.session)) || others[others.length - 1];
+      await switchSlot(ctx, next.slot);
+      if (selectedSession !== next.session || mux?.active?.session !== next.session) return;
+      await locked(path, current => {
+        const host = current?.threads.find(thread => thread.session === session);
+        if (!current || current.root !== session || !host || host.closed || host.pid !== process.pid) throw new Error("The current thread is no longer available");
+        host.slot = ""; host.closed = true; delete host.working; delete host.unread;
+        writeGroup(path, current);
+      });
+      stopHostWork(ctx);
+      refreshFooterSlots();
+    } catch (e) {
+      if (!hostClosed(ctx)) {
+        mux?.showMain(); selectedSession = session; updateViewing(); refreshMode();
+      }
+      notifyThreadFailure(ctx, e, "Could not close thread");
+    } finally { if (closing === session) closing = undefined; }
   }
   async function closeThread(ctx: ExtensionContext, session: string) {
     const manager = mux;
@@ -592,17 +709,19 @@ export default async function (pi: ExtensionAPI) {
         if (manager.children.has(session) || entry.reservedAt || pidAlive(entry.pid)) throw new Error("The thread was reopened while closing");
         group.threads = group.threads.filter(t => t !== entry);
         writeGroup(path, group);
-        // Forks are appended to the registry when created, regardless of slot number.
-        return [...group.threads].reverse().find(t => t.session !== group.root && existsSync(t.session))?.slot
-          ?? group.threads.find(t => t.session === group.root)?.slot;
+        // Threads are appended to the registry when created, regardless of slot number.
+        const remaining = visibleThreads(group);
+        return [...remaining].reverse().find(t => t.session !== group.root && (existsSync(t.session) || manager.children.has(t.session)))?.slot
+          ?? remaining.find(t => t.session === group.root)?.slot;
       });
       closed = true;
-      if (request === focusGeneration && next) {
+      if (request === focusGeneration) {
         closing = undefined;
-        await switchSlot(ctx, next);
+        if (next) await switchSlot(ctx, next);
+        else if (hostClosed(ctx)) { ctx.abort(); ctx.shutdown(); }
       }
     } catch (e) {
-      if (manager.active === child) {
+      if (manager.active === child && !hostClosed(ctx)) {
         manager.showMain(); selectedSession = ctx.sessionManager.getSessionFile(); updateViewing(); refreshMode();
       }
       ctx.ui.notify(`${closed ? "Thread closed, but could not switch" : "Could not close thread"}: ${errorText(e)}`, "error");
@@ -640,7 +759,7 @@ export default async function (pi: ExtensionAPI) {
       return focusSlot(ctx, existing.slot);
     }
     const numbered = [...(pickerTargets?.().values() || [])].find(target => target.entry === entryId);
-    const slot = numbered?.slot || [...childSlots].find(s => !group?.threads.some(t => t.slot === s));
+    const slot = numbered?.slot || [...slots].find(s => !visibleThreads(group).some(t => t.slot === s));
     if (!slot) { ctx.ui.notify("All thread slots are in use. Close a thread to free a number.", "warning"); return; }
     const entry = ctx.sessionManager.getEntry(entryId) as Entry | undefined;
     const boundary = numbered?.boundary || (entry && boundaryFor(ctx, entryId));
@@ -701,8 +820,8 @@ export default async function (pi: ExtensionAPI) {
         const numbered = (): Map<string, Target> => {
           const session = ctx.sessionManager.getSessionFile();
           const group = groupFile && readGroup(groupFile);
-          const threads = group?.threads || [];
-          const free = [...childSlots].filter(slot => !threads.some(t => t.slot === slot));
+          const threads = visibleThreads(group);
+          const free = [...slots].filter(slot => !threads.some(t => t.slot === slot));
           const result = new Map<string, Target>();
           const rows = visible();
           const selectedId = list.getSelectedNode()?.entry.id;
@@ -764,7 +883,7 @@ export default async function (pi: ExtensionAPI) {
           render(width: number) {
             const group = groupFile && readGroup(groupFile);
             const threads = selectorHeld ? renderThreadIndicators(footerSlots, theme, performance.now()) : "";
-            const closeHint = group && group.root !== selectedSession ? " · ctrl+esc to close this thread" : "";
+            const closeHint = group ? " · ctrl+esc to close this thread" : "";
             const detail = threads ? theme.fg("dim", "  Threads: ") + threads + theme.fg("dim", ` (brackets = current) · ${searchPrefix}+number: search digits${closeHint}`)
               : theme.fg("dim", `  ${searchPrefix}+number: search digits${closeHint}`);
             return [
@@ -817,6 +936,7 @@ export default async function (pi: ExtensionAPI) {
       && !(thread.reservedAt && Date.now() - thread.reservedAt < 120000));
   }
   async function switchOrCreate(ctx: ExtensionContext, slot: string) {
+    if (closing) return;
     const group = groupFile ? readGroup(groupFile) : undefined;
     const thread = group?.threads.find(entry => entry.slot === slot);
     if (missingThread(ctx, group, thread)) {
@@ -845,7 +965,7 @@ export default async function (pi: ExtensionAPI) {
           const boundary = index < 0 ? undefined : safeBoundary(branch, index);
           if (!boundary || boundary !== target.boundary) throw new Error("The selected message is no longer available; select it again");
         } else {
-          const slot = [...childSlots].find(s => !group.threads.some(t => t.slot === s));
+          const slot = [...slots].find(s => !visibleThreads(group).some(t => t.slot === s));
           if (!slot) throw new Error("All thread slots are in use");
           const entry = [...activeBranch].reverse().find(e =>
             (e.type === "message" && e.message.role !== "system") || (e.type === "custom_message" && e.display) || e.type === "compaction" || e.type === "branch_summary");
@@ -883,7 +1003,7 @@ export default async function (pi: ExtensionAPI) {
         if (!group) throw new Error("Thread registry disappeared");
         const existing = requestedSlot ? group.threads.find(t => t.slot === requestedSlot) : undefined;
         if (existing && !missingThread(ctx, group, existing)) return existing.slot;
-        const slot = requestedSlot || [...childSlots].find(s => !group.threads.some(t => t.slot === s));
+        const slot = requestedSlot || [...slots].find(s => !visibleThreads(group).some(t => t.slot === s));
         if (!slot) throw new Error("All thread slots are in use");
         if (existing?.kickoff && existsSync(existing.kickoff)) throw new Error(`Thread ${slot} has an unsent reply; its missing session was not replaced`);
         const fresh = SessionManager.create(ctx.cwd, ctx.sessionManager.getSessionDir());
@@ -909,7 +1029,7 @@ export default async function (pi: ExtensionAPI) {
     } finally { creating = false; }
   }
   async function settings(ctx: ExtensionContext) {
-    const choices = ["Open thread tree shortcut", "Thread modifier prefix", "Previous thread shortcut", "Next thread shortcut", "New thread shortcut", "Main thread shortcut", "Restore defaults"];
+    const choices = ["Open thread tree shortcut", "Thread modifier prefix", "Previous thread shortcut", "Next thread shortcut", "New thread shortcut", "Thread 1 shortcut", "Restore defaults"];
     const picked = await ctx.ui.select("Thread keybindings", choices);
     if (!picked) return;
     let nextConfig: Config;
@@ -939,6 +1059,11 @@ export default async function (pi: ExtensionAPI) {
       return { cancel: true };
     }
     const thread = found.group.threads.find(t => t.session === event.targetSessionFile);
+    if (thread?.closed && thread.session === found.group.root) {
+      if (bridge) void bridge.switch("reopen-host").catch(e => ctx.ui.notify(`Could not reopen thread: ${errorText(e)}`, "error"));
+      else ctx.ui.notify("The thread manager is not connected yet", "warning");
+      return { cancel: true };
+    }
     if (thread) {
       ctx.ui.notify(`That session is already thread ${thread.slot}. Switch with ${config.prefix}+${thread.slot}.`, "warning");
       return { cancel: true };
@@ -1011,7 +1136,8 @@ export default async function (pi: ExtensionAPI) {
       if (isCloseShortcut(raw)) {
         if (bridge && childToken) {
           void bridge.switch(`close:${childToken}`).catch(e => ctx.ui.notify(`Could not close thread: ${errorText(e)}`, "error"));
-        } else ctx.ui.notify(childSocket ? "The thread manager is not connected yet" : "The main thread cannot be closed with Ctrl+Esc", "info");
+        } else if (childSocket) ctx.ui.notify("The thread manager is not connected yet", "info");
+        else void closeHost(ctx);
         return { consume: true };
       }
       if (matchesKey(data, "escape") && pending && !targetMode) {
@@ -1165,7 +1291,7 @@ export default async function (pi: ExtensionAPI) {
         { value: "off", label: "off", description: "Cancel a pending thread reply" },
         { value: "show", label: "show", description: "Choose an existing thread" },
         { value: "keybinding", label: "keybinding", description: "Configure shortcuts" },
-        ...(group?.threads || []).map(t => ({ value: t.slot, label: t.slot, description: `Switch to ${t.title}` })),
+        ...visibleThreads(group).map(t => ({ value: t.slot, label: t.slot, description: `Switch to ${t.title}` })),
       ];
       const matches = options.filter(option => option.value.startsWith(prefix));
       // Once a complete command is typed, Enter should run it instead of accepting it again.
@@ -1189,5 +1315,5 @@ export default async function (pi: ExtensionAPI) {
   for (const slot of slots) pi.registerShortcut(`${config.prefix}+${slot}` as any, { description: `Switch to or create thread ${slot}`, handler: ctx => switchOrCreate(ctx, slot) });
   pi.registerShortcut(config.previous as any, { description: "Previous chat thread", handler: ctx => cycle(ctx, -1) });
   pi.registerShortcut(config.next as any, { description: "Next chat thread", handler: ctx => cycle(ctx, 1) });
-  pi.registerShortcut(config.mainThread as any, { description: "Return to the main chat thread", handler: ctx => switchOrCreate(ctx, "1") });
+  pi.registerShortcut(config.mainThread as any, { description: "Switch to or create thread 1", handler: ctx => switchOrCreate(ctx, "1") });
 }
