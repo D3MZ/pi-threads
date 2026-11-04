@@ -1,8 +1,14 @@
 # pi-threads
 Threaded side conversations that fork the existing chat at any point you choose that operates async. Tested with Ghostty, should work with Kitty's protocol, but may need to rebind (i.e. cmux)
-1. Hold down Ctrl + number to fork at that point
+1. Tap Ctrl to open the tree, choose a message, and reply to fork a thread.
 2. Close thread with Ctrl + Esc
 3. Enjoy.
+
+## Thread activity
+
+Hold **Ctrl** to see the thread selector: working threads pulse, completed threads with unread activity stay white, and other threads are dim. Brackets mark the current thread; press **Ctrl + number** to switch.
+
+![Thread selector showing working and unread activity](assets/thread-activity.gif)
 
 ## Installation
 Ask your clanker, or
