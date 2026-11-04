@@ -209,7 +209,7 @@ function notifyThreadFailure(ctx: ExtensionContext, error: unknown, prefix: stri
 export default async function (pi: ExtensionAPI) {
   // Native ESM imports otherwise keep the old mux implementation after /reload.
   const muxUrl = new URL("./terminal-mux.mjs", import.meta.url);
-  muxUrl.searchParams.set("v", createHash("sha256").update(readFileSync(muxUrl)).digest("hex"));
+  muxUrl.searchParams.set("v", createHash("sha256").update(readFileSync(muxUrl)).update(readFileSync(new URL("./screen-transition.mjs", import.meta.url))).digest("hex"));
   const { TerminalMux, connectThread } = await loadTerminalMux(muxUrl.href);
   const config = loadConfig();
   const reserved = new Set([config.targets, config.previous, config.next, config.newThread, config.mainThread, ...[...slots].map(slot => `${config.prefix}+${slot}`)].map(shortcutSignature));
@@ -233,6 +233,7 @@ export default async function (pi: ExtensionAPI) {
   let keyboardTimer: ReturnType<typeof setInterval> | undefined;
   let terminalFocused = true;
   let focusPatch: { tui: any; original: Function; replacement: Function } | undefined;
+  let startupPaintPatch: { tui: any; original: Function; replacement: Function } | undefined;
   let focusGeneration = 0;
   let selectedSession: string | undefined;
   const shared = globalThis as any;
@@ -494,12 +495,12 @@ export default async function (pi: ExtensionAPI) {
     };
     if (!mux) shared[muxKey] = mux = new TerminalMux({ ui, onSwitch, onExit, onRebind, getAppearance, isFocused, onChildInput, isPrefixHeld });
     else {
-      // Reload preserves live PTYs; upgrade the existing manager as well as its callbacks.
-      // Reinstall an old input wrapper on the next switch so it uses the new handlers.
+      // Reload preserves live PTYs; upgrade their manager and input routing too.
       const upgrading = Object.getPrototypeOf(mux) !== TerminalMux.prototype;
       Object.setPrototypeOf(mux, TerminalMux.prototype);
-      if (upgrading && !mux.active) mux.detachInput();
+      if (upgrading) mux.detachInput();
       mux.bind(ui, onSwitch, onExit, getAppearance, isFocused, onChildInput, isPrefixHeld, onRebind);
+      if (upgrading && mux.active) mux.installInput();
     }
     return mux;
   }
@@ -551,6 +552,7 @@ export default async function (pi: ExtensionAPI) {
   async function switchSlot(ctx: ExtensionContext, slot: string) {
     if (bridge) { await bridge.switch(slot); return; }
     const request = ++focusGeneration;
+    mux?.screenTransition?.cancel();
     if (!groupFile) await registerMe(ctx, true);
     const thread = readGroup(groupFile!)?.threads.find(t => t.slot === slot);
     if (!thread || (thread.session !== ctx.sessionManager.getSessionFile() && !existsSync(thread.session) && !mux?.children.has(thread.session))) throw new Error(`Thread ${slot} is unavailable`);
@@ -562,18 +564,26 @@ export default async function (pi: ExtensionAPI) {
     const child = await ensureTerminal(ctx, thread);
     if (request !== focusGeneration) return;
     const manager = getMux(ctx);
-    selectedSession = thread.session;
-    updateViewing();
-    try { await manager.show(child); }
-    catch (e) {
+    try {
+      const shown = await manager.show(child);
+      if (!shown || request !== focusGeneration || manager.active !== child || manager.children.get(child.session) !== child) return;
+      selectedSession = thread.session; updateViewing(); refreshMode();
+    } catch (e) {
       if (request !== focusGeneration) return;
-      if (hostClosed(ctx)) {
-        if (previous && previous !== child && manager.children.get(previous.session) === previous) {
+      if (previous && manager.children.get(previous.session) === previous) {
+        try {
+          if (manager.active !== previous) await manager.show(previous);
+          if (request !== focusGeneration) return;
           selectedSession = previous.session; updateViewing(); refreshMode();
-          try { await manager.show(previous); } catch { if (!closing && !recovering) void focusRemaining(ctx, thread.session); }
-        } else if (!closing && !recovering) void focusRemaining(ctx, thread.session);
+        } catch {
+          if (hostClosed(ctx)) { if (!closing && !recovering) void focusRemaining(ctx, thread.session); }
+          else { manager.showMain(); selectedSession = ctx.sessionManager.getSessionFile(); updateViewing(); refreshMode(); }
+        }
+      } else if (hostClosed(ctx)) {
+        if (!closing && !recovering) void focusRemaining(ctx, thread.session);
       } else {
-        manager.showMain(); selectedSession = ctx.sessionManager.getSessionFile(); updateViewing(); refreshMode();
+        if (manager.active) manager.showMain();
+        selectedSession = ctx.sessionManager.getSessionFile(); updateViewing(); refreshMode();
       }
       throw e;
     }
@@ -1197,7 +1207,8 @@ export default async function (pi: ExtensionAPI) {
     }
     if (session && childSocket && childToken) {
       const model = ctx.model;
-      bridge = connectThread({ path: childSocket, token: childToken, session,
+      const waitForPaint = event.reason === "startup" && typeof ui?.renderNow === "function";
+      bridge = connectThread({ path: childSocket, token: childToken, session, waitForPaint,
         previousSession: replacing ? event.previousSessionFile : undefined, reason: recovering ? "recover" : event.reason,
         header: rebinding ? ctx.sessionManager.getHeader() : undefined,
         initialModel: rebinding && model ? { provider: model.provider, id: model.id, thinking: pi.getThinkingLevel() } : undefined,
@@ -1215,6 +1226,18 @@ export default async function (pi: ExtensionAPI) {
           inheritedPrefixHeld = held === true && terminalFocused;
           setSelectorHeld(inheritedPrefixHeld);
         } });
+      if (waitForPaint) {
+        const tui = ui, original = tui.renderNow, connection = bridge;
+        const replacement = function (this: any, ...args: any[]) {
+          if (tui.renderNow === replacement) tui.renderNow = original;
+          if (startupPaintPatch?.replacement === replacement) startupPaintPatch = undefined;
+          const result = original.apply(this, args);
+          connection.painted();
+          return result;
+        };
+        startupPaintPatch = { tui, original, replacement };
+        tui.renderNow = replacement;
+      }
       if (rebinding) {
         try { await bridge.ready; await registerMe(ctx, false, true); refreshFooterSlots(); }
         catch (e) { notifyThreadFailure(ctx, e, "Could not reconnect thread", "warning"); }
@@ -1239,6 +1262,12 @@ export default async function (pi: ExtensionAPI) {
   });
   pi.on("session_shutdown", async (event, ctx) => {
     pending = undefined; hideTargets(); focusGeneration++; restoreFooter(); unsubscribeInput?.();
+    if (!childSocket) mux?.screenTransition?.cancel();
+    if (startupPaintPatch) {
+      const { tui, original, replacement } = startupPaintPatch;
+      if (tui.renderNow === replacement) tui.renderNow = original;
+      startupPaintPatch = undefined;
+    }
     bridge?.close(); bridge = undefined;
     if (keyboardTimer) clearInterval(keyboardTimer);
     if (keyboardEnabled && ui?.terminal?.kittyProtocolActive) ui.terminal.write("\x1b[=24;3u");

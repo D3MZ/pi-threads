@@ -5,6 +5,9 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 
+const transitionUrl = new URL("./screen-transition.mjs", import.meta.url);
+transitionUrl.search = new URL(import.meta.url).search;
+const { maxStartupChars, ScreenTransition } = await import(transitionUrl.href);
 const require = createRequire(import.meta.url);
 
 function preparePty() {
@@ -49,25 +52,42 @@ export class TerminalMux {
     this.server.unref();
     this.output = process.stdout.write;
     this.owner = this;
-    const mux = this;
-    this.outputWrapper = function (chunk, encoding, callback) {
-      if (!mux.active) return mux.output.apply(this, arguments);
-      const done = typeof encoding === "function" ? encoding : callback;
-      if (done) process.nextTick(done);
-      return true;
-    };
-    process.stdout.write = this.outputWrapper;
+    this.screenTransition = new ScreenTransition(this);
+    this.installOutput();
     this.onResize = () => {
       const cols = Math.max(1, this.ui.terminal.columns), rows = Math.max(1, this.ui.terminal.rows);
       for (const child of this.children.values()) {
         try { child.pty.resize(cols, rows); } catch {}
       }
+      this.screenTransition?.resize();
     };
     process.stdout.on("resize", this.onResize);
   }
   bind(ui, onSwitch, onExit, getAppearance, isFocused, onChildInput, isPrefixHeld, onRebind) {
     this.ui = ui; this.onSwitch = onSwitch; this.onExit = onExit; this.onRebind = onRebind; this.getAppearance = getAppearance; this.isFocused = isFocused;
     this.onChildInput = onChildInput; this.isPrefixHeld = isPrefixHeld;
+    if (!this.screenTransition) {
+      this.screenTransition = new ScreenTransition(this); this.installOutput();
+      const oldResize = this.onResize;
+      process.stdout.off("resize", oldResize);
+      this.onResize = () => { oldResize(); this.screenTransition?.resize(); };
+      process.stdout.on("resize", this.onResize);
+    } else if (Object.getPrototypeOf(this.screenTransition) !== ScreenTransition.prototype) {
+      this.screenTransition.cancel();
+      Object.setPrototypeOf(this.screenTransition, ScreenTransition.prototype);
+    }
+  }
+  installOutput() {
+    if (this.outputWrapper && process.stdout.write !== this.outputWrapper) return;
+    const mux = this;
+    this.outputWrapper = function (chunk, encoding, callback) {
+      const data = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString(typeof encoding === "string" ? encoding : "utf8");
+      if (!mux.screenTransition?.hostOutput(data) && !mux.active) return mux.output.apply(this, arguments);
+      const done = typeof encoding === "function" ? encoding : callback;
+      if (done) process.nextTick(done);
+      return true;
+    };
+    process.stdout.write = this.outputWrapper;
   }
   write(data) { this.output.call(process.stdout, data); }
   accept(socket) {
@@ -88,9 +108,11 @@ export class TerminalMux {
           const attach = () => {
             if (socket.destroyed) throw new Error("Thread connection closed");
             child.socket?.destroy(); child.socket = socket;
+            child.screenReady = message.waitForPaint !== true;
             child.resolveReady();
             this.send(child, { type: "ready" });
             if (this.active === child) this.activate(child);
+            else this.screenTransition?.connected(child);
           };
           if (message.session === previous) attach();
           else {
@@ -118,6 +140,8 @@ export class TerminalMux {
             });
             handshake.catch(() => {});
           }
+        } else if (message.type === "painted") {
+          handshake.then(() => { child.screenReady = true; this.screenTransition?.connected(child); }).catch(() => {});
         } else if (message.type === "switch" && typeof message.slot === "string") {
           handshake.then(() => this.onSwitch(message.slot)).then(
             () => this.send(child, { type: "response", id: message.id }),
@@ -143,9 +167,16 @@ export class TerminalMux {
     let resolveReady, rejectReady;
     const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
     ready.catch(() => {});
-    const child = { session, token, pty, ready, resolveReady, rejectReady, socket: undefined, startup: "", negotiated: false, pendingInput: [], dynamicExit: true };
+    const child = { session, token, pty, ready, resolveReady, rejectReady, socket: undefined, startup: "", screenStartup: "", negotiated: false, pendingInput: [], dynamicExit: true };
     this.children.set(session, child);
     pty.onData(data => {
+      if (typeof child.screenStartup === "string") {
+        if (child.screenStartup.length + data.length <= maxStartupChars) child.screenStartup += data;
+        else if (this.screenTransition?.pending?.child === child) {
+          child.screenStartup += data;
+          this.screenTransition.pending.fallback = true;
+        } else child.screenStartup = undefined;
+      }
       if (!child.negotiated) {
         const startup = child.startup + data;
         if (startup.includes("\x1b[?u")) {
@@ -177,14 +208,14 @@ export class TerminalMux {
     const handled = this.onExit?.(currentSession, child.pty.pid, wasActive, child.unpersistedHeader);
     if (wasActive && handled !== true) this.showMain();
   }
-  async show(child) {
+  installInput() {
     if (!this.inputWrapper) {
       const terminal = this.ui.terminal;
       if (typeof terminal.inputHandler !== "function") throw new Error("Pi terminal input is not ready");
       this.terminal = terminal;
       this.input = terminal.inputHandler;
       this.inputWrapper = data => {
-        const child = this.active;
+        const child = this.screenTransition ? this.screenTransition.inputTarget() : this.active;
         if (!child) this.input(data);
         else {
           // The host tracks physical focus and the held modifier while the
@@ -197,22 +228,14 @@ export class TerminalMux {
       };
       terminal.inputHandler = this.inputWrapper;
     }
-    this.active = child;
+  }
+  show(child) {
+    this.installInput();
     this.onResize();
-    // Ensure both applications see the same physical screen and key mode.
-    this.write(`\x1b[?1049h\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h${this.ui.terminal.kittyProtocolActive ? "\x1b[=31u" : ""}\x1b[2J\x1b[H`);
-    if (child.socket) this.activate(child);
-    let timer;
-    try {
-      await Promise.race([child.ready, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Pi thread did not start within 2 minutes")), 120000); })]);
-    } finally { clearTimeout(timer); }
+    return this.screenTransition.show(child);
   }
   activate(child) { this.send(child, { type: "activate", appearance: this.getAppearance?.(), focused: this.isFocused?.() !== false, prefixHeld: this.isPrefixHeld?.() === true }); }
-  showMain() {
-    this.active = undefined;
-    this.write(`\x1b[?1049h\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h${this.ui.terminal.kittyProtocolActive ? "\x1b[=31u" : ""}\x1b[2J\x1b[H`);
-    this.ui.requestRender(true);
-  }
+  showMain() { this.screenTransition.showMain(); }
   stop(session) {
     const child = this.children.get(session);
     if (child) child.pty.kill();
@@ -222,6 +245,7 @@ export class TerminalMux {
     this.terminal = undefined; this.input = undefined; this.inputWrapper = undefined;
   }
   dispose() {
+    this.screenTransition?.cancel();
     this.active = undefined;
     for (const child of this.children.values()) { try { child.pty.kill(); } catch {} child.socket?.destroy(); }
     this.children.clear();
@@ -233,7 +257,7 @@ export class TerminalMux {
   }
 }
 
-export function connectThread({ path, token, session, previousSession, reason, header, initialModel, onActivate, onModifier }) {
+export function connectThread({ path, token, session, previousSession, reason, header, initialModel, waitForPaint, onActivate, onModifier }) {
   const socket = createConnection(path);
   socket.setEncoding("utf8");
   let buffer = "", nextId = 0, resolveReady, rejectReady;
@@ -260,9 +284,10 @@ export function connectThread({ path, token, session, previousSession, reason, h
   socket.on("close", () => fail(new Error("Thread manager disconnected")));
   // Queue the handshake before a shortcut can enqueue a switch on a socket
   // that is still connecting; the server requires hello to arrive first.
-  socket.write(`${JSON.stringify({ type: "hello", token, session, previousSession, reason, header, initialModel })}\n`);
+  socket.write(`${JSON.stringify({ type: "hello", token, session, previousSession, reason, header, initialModel, waitForPaint })}\n`);
   return {
     ready,
+    painted() { if (!socket.destroyed) socket.write(`${JSON.stringify({ type: "painted" })}\n`); },
     switch(slot) {
       if (socket.destroyed) return Promise.reject(new Error("Thread manager disconnected"));
       const id = ++nextId;
