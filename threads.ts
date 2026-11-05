@@ -250,6 +250,7 @@ export default async function (pi: ExtensionAPI) {
   let selectedSession: string | undefined;
   const shared = globalThis as any;
   const muxKey = Symbol.for("pi.threads.terminalMux");
+  const hostHandoffKey = Symbol.for("pi.threads.hostHandoff");
   // Adopt the old mux on reload instead of restarting live child processes.
   const legacyMuxKey = Symbol.for("pi.chatthreads.terminalMux");
   let mux: InstanceType<typeof TerminalMux> | undefined = shared[muxKey] || shared[legacyMuxKey];
@@ -421,7 +422,9 @@ export default async function (pi: ExtensionAPI) {
     const session = ctx.sessionManager.getSessionFile();
     if (!session || (!allowUnsaved && !existsSync(session))) throw new UnsavedSessionError("A saved Pi session is required");
     const found = findGroup(session);
-    const path = found?.path || groupPath(session);
+    let path = found?.path || groupPath(session);
+    // A group can keep its original registry path after its host changes sessions.
+    if (!found) for (let n = 1; readGroup(path); n++) path = groupPath(`${session}\0${n}`);
     await locked(path, existing => {
       const group: Group = existing || { version: 1, root: session, threads: [{ slot: "1", session, title: "Main" }] };
       let me = group.threads.find(t => t.session === session);
@@ -534,7 +537,7 @@ export default async function (pi: ExtensionAPI) {
       Object.setPrototypeOf(mux, TerminalMux.prototype);
       if (upgrading) mux.detachInput();
       mux.bind(ui, onSwitch, onExit, getAppearance, isFocused, onChildInput, isPrefixHeld, onRebind, getPrefixHeldAt);
-      if (upgrading && mux.active) mux.installInput();
+      if (mux.active) mux.installInput();
     }
     return mux;
   }
@@ -701,11 +704,15 @@ export default async function (pi: ExtensionAPI) {
   }
   async function closeHost(ctx: ExtensionContext) {
     if (closing) return;
+    if (creating) { ctx.ui.notify("A thread is starting; please wait.", "info"); return; }
     const session = ctx.sessionManager.getSessionFile();
     const path = groupFile;
     const group = path && readGroup(path);
     const others = visibleThreads(group).filter(thread => thread.session !== session);
-    if (!others.length) { stopHostWork(ctx); ctx.shutdown(); return; }
+    if (!others.length) {
+      if (mux?.children.size) { ctx.ui.notify("Cannot close while the thread registry is unavailable.", "warning"); return; }
+      stopHostWork(ctx); ctx.shutdown(); return;
+    }
     if (!path || !session) throw new Error("The current thread is unavailable");
     closing = session;
     try {
@@ -1107,16 +1114,37 @@ export default async function (pi: ExtensionAPI) {
     ctx.ui.notify("Shortcuts saved. Run /reload to apply them.", "info");
   }
 
+  function hostRegistryReady(ctx: ExtensionContext) {
+    if (childSocket || !mux?.children.size) return true;
+    const session = ctx.sessionManager.getSessionFile();
+    const group = groupFile && readGroup(groupFile);
+    if (group?.root === session && group.threads.some(thread => thread.session === session)) return true;
+    ctx.ui.notify("Cannot change sessions while the thread registry is unavailable.", "warning");
+    return false;
+  }
+  pi.on("session_before_fork", (_event, ctx) => {
+    if (!hostRegistryReady(ctx)) return { cancel: true };
+  });
   pi.on("session_before_switch", (event, ctx) => {
-    if (!childSocket || !groupFile || event.reason !== "resume" || !event.targetSessionFile) return;
+    if (!hostRegistryReady(ctx)) return { cancel: true };
+    const session = ctx.sessionManager.getSessionFile();
+    const group = groupFile && readGroup(groupFile);
+    const preservingHost = !childSocket && (!!mux?.children.size || visibleThreads(group).some(thread => thread.session !== session));
+    if ((!childSocket && !preservingHost) || !groupFile || event.reason !== "resume" || !event.targetSessionFile) return;
     const found = findGroup(event.targetSessionFile);
-    if (!found || event.targetSessionFile === ctx.sessionManager.getSessionFile()) return;
-    if (found.path !== groupFile) {
-      ctx.ui.notify("That session belongs to another thread group. Resume it from the main session instead.", "warning");
+    if (event.targetSessionFile === session) return;
+    if (found && found.path !== groupFile) {
+      ctx.ui.notify(childSocket ? "That session belongs to another thread group. Resume it from the main session instead." : "That session belongs to another thread group. Resume it in another Pi window instead.", "warning");
       return { cancel: true };
     }
-    const thread = found.group.threads.find(t => t.session === event.targetSessionFile);
-    if (thread?.closed && thread.session === found.group.root) {
+    if (!childSocket) try {
+      if (resolve(SessionManager.open(event.targetSessionFile).getCwd()) !== resolve(ctx.cwd)) {
+        ctx.ui.notify("Close the other threads before switching to a different directory.", "warning");
+        return { cancel: true };
+      }
+    } catch { /* Pi will report an invalid session. */ }
+    const thread = found?.group.threads.find(t => t.session === event.targetSessionFile);
+    if (thread?.closed && thread.session === found?.group.root) {
       if (bridge) void bridge.switch("reopen-host").catch(e => ctx.ui.notify(`Could not reopen thread: ${errorText(e)}`, "error"));
       else ctx.ui.notify("The thread manager is not connected yet", "warning");
       return { cancel: true };
@@ -1273,13 +1301,35 @@ export default async function (pi: ExtensionAPI) {
       if (key && (key.text !== undefined || data !== raw)) return { data: key.text ?? data };
     });
     const session = ctx.sessionManager.getSessionFile();
+    const handoff: { path: string; previous: string } | undefined = childSocket ? undefined : shared[hostHandoffKey];
+    if (handoff) {
+      delete shared[hostHandoffKey];
+      if (session && event.previousSessionFile === handoff.previous && ["new", "resume", "fork"].includes(event.reason)) try {
+        const other = findGroup(session);
+        if (other && other.path !== handoff.path) throw new Error("That session belongs to another thread group");
+        await locked(handoff.path, group => {
+          const host = group?.threads.find(thread => thread.session === handoff.previous);
+          if (!group || group.root !== handoff.previous || !host) throw new Error("The original thread is no longer registered");
+          if (group.threads.some(thread => thread !== host && thread.session === session)) throw new Error("That session is already open in another thread");
+          group.root = host.session = session;
+          host.pid = process.pid;
+          host.title = event.reason === "new" ? "New session" : event.reason === "fork" ? "Forked session" : "Session";
+          delete host.working; delete host.unread; delete host.settledTurns; delete host.lastSettledPid; delete host.lastTurnAborted;
+          if (group.viewing === handoff.previous) group.viewing = session;
+          writeGroup(handoff.path, group);
+        });
+      } catch (e) {
+        groupFile = handoff.path;
+        notifyThreadFailure(ctx, e, "Could not reconnect the host session", "warning");
+      }
+    }
     const registered = session && findGroup(session);
     const replacing = !!(childSocket && event.previousSessionFile && session && event.previousSessionFile !== session && ["new", "resume", "fork"].includes(event.reason));
     // Reconnect a session that /new disconnected before this version was loaded.
     const recovering = !!(childSocket && session && event.reason === "reload" && !registered);
     const rebinding = replacing || recovering;
     if (session && !rebinding && registered) {
-      try { await registerMe(ctx, false, !!childSocket); } catch (e) { notifyThreadFailure(ctx, e, "Pi Threads", "warning"); }
+      try { await registerMe(ctx, false, true); } catch (e) { notifyThreadFailure(ctx, e, "Pi Threads", "warning"); }
     }
     if (session && childSocket && childToken) {
       const model = ctx.model;
@@ -1357,8 +1407,14 @@ export default async function (pi: ExtensionAPI) {
     const session = ctx.sessionManager.getSessionFile();
     const path = groupFile;
     await viewQueue;
+    const preservingHost = !childSocket && !!session && !!path && ["new", "resume", "fork"].includes(event.reason)
+      && (!!mux?.children.size || visibleThreads(readGroup(path)).some(thread => thread.session !== session));
+    if (preservingHost) shared[hostHandoffKey] = { path, previous: session };
     if (event.reason !== "reload") {
-      if (!childSocket && mux) { mux.dispose(); delete shared[muxKey]; mux = undefined; }
+      if (!childSocket && mux) {
+        if (preservingHost) mux.detachInput();
+        else { mux.dispose(); delete shared[muxKey]; mux = undefined; }
+      }
       if (session && path) try {
         await locked(path, group => {
           const me = group?.threads.find(t => t.session === session && t.pid === process.pid);
