@@ -6,6 +6,7 @@ import { performance } from "node:perf_hooks";
 import { loadTerminalMux } from "./terminal-mux-loader.mjs";
 import { isCloseShortcut, parseKeyboardEvent } from "./keyboard.ts";
 import { heartbeatBrightness, renderThreadIndicators, type ThreadIndicator } from "./thread-activity.ts";
+import { registerThreadWake, type ThreadWakeup } from "./thread-wake.ts";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -21,8 +22,8 @@ const extensionPath = fileURLToPath(import.meta.url);
 const legacyExtensionPath = fileURLToPath(new URL("./chatthreads.ts", import.meta.url));
 const defaults = { targets: "ctrl+;", prefix: "ctrl", previous: "ctrl+shift+left", next: "ctrl+shift+right", newThread: "ctrl+n", mainThread: "ctrl+shift+1" };
 type Config = typeof defaults;
-type Thread = { slot: string; session: string; title: string; pid?: number; tty?: string; terminalId?: string; parent?: string; entry?: string; reservedAt?: number; kind?: "rpc" | "tui"; kickoff?: string; working?: boolean; unread?: boolean; closed?: boolean; initialModel?: { provider: string; id: string; thinking: string } };
-type Group = { version: 1; root: string; threads: Thread[]; viewing?: string };
+type Thread = { slot: string; session: string; title: string; pid?: number; tty?: string; terminalId?: string; parent?: string; entry?: string; reservedAt?: number; kind?: "rpc" | "tui"; kickoff?: string; working?: boolean; unread?: boolean; closed?: boolean; settledTurns?: number; lastSettledPid?: number; lastTurnAborted?: boolean; initialModel?: { provider: string; id: string; thinking: string } };
+type Group = { version: 1; root: string; threads: Thread[]; viewing?: string; wakeups?: ThreadWakeup[] };
 type Target = { entry: string; boundary: string; title: string; slot: string };
 type TreePreview = (width: number, theme: ExtensionContext["ui"]["theme"]) => string[];
 type PendingTarget = Target & { preview: TreePreview };
@@ -327,7 +328,7 @@ export default async function (pi: ExtensionAPI) {
       if (groupFile === path) refreshFooterSlots();
     }).catch(() => {});
   }
-  async function updateActivity(ctx: ExtensionContext, working: boolean) {
+  async function updateActivity(ctx: ExtensionContext, working: boolean, aborted = false) {
     if (ctx.mode !== "tui") return;
     localWorking = working;
     refreshFooterSlots();
@@ -340,6 +341,9 @@ export default async function (pi: ExtensionAPI) {
         if (working) me.working = true;
         else {
           delete me.working;
+          me.settledTurns = (Number.isSafeInteger(me.settledTurns) && me.settledTurns! >= 0 ? me.settledTurns! : 0) + 1;
+          me.lastSettledPid = process.pid;
+          me.lastTurnAborted = aborted;
           if (group.viewing === session) delete me.unread;
           else me.unread = true;
         }
@@ -1123,10 +1127,10 @@ export default async function (pi: ExtensionAPI) {
     }
   });
   pi.on("before_agent_start", event => {
-    event.systemPromptOptions.sections.pi_threads = "Pi Threads plugin may have threads work concurrently in the same working directory, this is by design. Use pi logs to understand any unexpected code changes and work around it. You're working with pretty smart agents, you'll all figure it out.";
+    event.systemPromptOptions.sections.pi_threads = "Pi Threads plugin may have threads work concurrently in the same working directory, this is by design. Use pi logs to understand any unexpected code changes and work around it. You're working with pretty smart agents, you'll all figure it out. For authorized follow-up after a thread settles, find pi_threads_wake with tool search.";
   });
   pi.on("agent_start", (_event, ctx) => updateActivity(ctx, true));
-  pi.on("agent_settled", (_event, ctx) => updateActivity(ctx, false));
+  pi.on("agent_settled", (event, ctx) => updateActivity(ctx, false, event.aborted));
   pi.on("session_start", async (event, ctx) => {
     if (ctx.mode !== "tui") return;
     context = ctx;
@@ -1418,4 +1422,13 @@ export default async function (pi: ExtensionAPI) {
   pi.registerShortcut(config.previous as any, { description: "Previous chat thread", handler: ctx => cycle(ctx, -1) });
   pi.registerShortcut(config.next as any, { description: "Next chat thread", handler: ctx => cycle(ctx, 1) });
   pi.registerShortcut(config.mainThread as any, { description: "Switch to or create thread 1", handler: ctx => switchOrCreate(ctx, "1") });
+  registerThreadWake(pi, {
+    groupPath: () => groupFile,
+    ensureGroup: async ctx => {
+      if (!groupFile) await registerMe(ctx, true, !!childSocket);
+      if (!groupFile) throw new Error("Thread group is unavailable");
+      return groupFile;
+    },
+    readGroup, locked, writeGroup, pidAlive,
+  });
 }
