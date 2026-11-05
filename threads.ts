@@ -230,6 +230,7 @@ export default async function (pi: ExtensionAPI) {
   let prefixHeld = false;
   let inheritedPrefixHeld = false;
   let selectorHeld = false;
+  let selectorHeldAt = 0;
   let prefixTapStartedAt: number | undefined;
   let closePicker: (() => void) | undefined;
   let pickerTargets: (() => Map<string, Target>) | undefined;
@@ -265,22 +266,28 @@ export default async function (pi: ExtensionAPI) {
   let viewQueue = Promise.resolve();
   let unsubscribeInput: (() => void) | undefined;
 
+  const heartbeatElapsed = () => Date.now() - selectorHeldAt;
   function updateAnimation() {
     const animate = selectorHeld && locallyVisible && footerSlots.some(slot => slot.working);
     if (animate && !animationTimer) {
-      let brightness = heartbeatBrightness(performance.now());
+      let brightness = heartbeatBrightness(heartbeatElapsed());
       animationTimer = setInterval(() => {
-        const next = heartbeatBrightness(performance.now());
+        const next = heartbeatBrightness(heartbeatElapsed());
         if (next !== brightness) { brightness = next; ui?.requestRender(); }
-      }, 60);
+      }, 50);
       animationTimer.unref();
     } else if (!animate && animationTimer) {
       clearInterval(animationTimer); animationTimer = undefined;
     }
   }
-  function setSelectorHeld(held: boolean) {
-    if (selectorHeld === held) return;
+  function setSelectorHeld(held: boolean, heldAt?: number) {
+    const nextHeldAt = held ? heldAt ?? (selectorHeld ? selectorHeldAt : Date.now()) : selectorHeldAt;
+    if (selectorHeld === held && selectorHeldAt === nextHeldAt) return;
+    if (animationTimer && selectorHeldAt !== nextHeldAt) {
+      clearInterval(animationTimer); animationTimer = undefined;
+    }
     selectorHeld = held;
+    selectorHeldAt = nextHeldAt;
     refreshFooterSlots();
     ui?.requestRender();
   }
@@ -348,7 +355,7 @@ export default async function (pi: ExtensionAPI) {
       const footer = container.children[0];
       // Preserve custom footer content without assuming its layout or whether
       // it displays extension statuses. Keep our thread strip on its own row.
-      const indicators = renderThreadIndicators(footerSlots, ctx.ui.theme, performance.now());
+      const indicators = renderThreadIndicators(footerSlots, ctx.ui.theme, heartbeatElapsed());
       const separate = () => [...lines, ...wrapTextWithAnsi(indicators, Math.max(1, width))];
       if (typeof footer?.getSessionStats !== "function" || typeof footer?.footerData?.getExtensionStatuses !== "function" || lines.length < 2) return separate();
       const label = ` ${indicators}`;
@@ -481,6 +488,7 @@ export default async function (pi: ExtensionAPI) {
       return changed;
     };
     const isPrefixHeld = () => terminalFocused && prefixHeld;
+    const getPrefixHeldAt = () => isPrefixHeld() ? selectorHeldAt : undefined;
     const onRebind = async (previous: string, session: string, child: any, message: any, current: () => boolean) => {
       const path = groupFile;
       if (!path || !["new", "resume", "fork", "recover"].includes(message.reason)) throw new Error("Invalid thread session replacement");
@@ -503,13 +511,13 @@ export default async function (pi: ExtensionAPI) {
       });
       if (selectedSession === previous) { selectedSession = session; refreshMode(); }
     };
-    if (!mux) shared[muxKey] = mux = new TerminalMux({ ui, onSwitch, onExit, onRebind, getAppearance, isFocused, onChildInput, isPrefixHeld });
+    if (!mux) shared[muxKey] = mux = new TerminalMux({ ui, onSwitch, onExit, onRebind, getAppearance, isFocused, onChildInput, isPrefixHeld, getPrefixHeldAt });
     else {
       // Reload preserves live PTYs; upgrade their manager and input routing too.
       const upgrading = Object.getPrototypeOf(mux) !== TerminalMux.prototype;
       Object.setPrototypeOf(mux, TerminalMux.prototype);
       if (upgrading) mux.detachInput();
-      mux.bind(ui, onSwitch, onExit, getAppearance, isFocused, onChildInput, isPrefixHeld, onRebind);
+      mux.bind(ui, onSwitch, onExit, getAppearance, isFocused, onChildInput, isPrefixHeld, onRebind, getPrefixHeldAt);
       if (upgrading && mux.active) mux.installInput();
     }
     return mux;
@@ -902,7 +910,7 @@ export default async function (pi: ExtensionAPI) {
         selector.children.splice(4, 0, {
           render(width: number) {
             const group = groupFile && readGroup(groupFile);
-            const threads = selectorHeld ? renderThreadIndicators(footerSlots, theme, performance.now()) : "";
+            const threads = selectorHeld ? renderThreadIndicators(footerSlots, theme, heartbeatElapsed()) : "";
             const closeHint = group ? " · ctrl+esc to close this thread" : "";
             const detail = threads ? theme.fg("dim", "  Threads: ") + threads + theme.fg("dim", ` (brackets = current) · ${searchPrefix}+number: search digits${closeHint}`)
               : theme.fg("dim", `  ${searchPrefix}+number: search digits${closeHint}`);
@@ -1225,19 +1233,19 @@ export default async function (pi: ExtensionAPI) {
         previousSession: replacing ? event.previousSessionFile : undefined, reason: recovering ? "recover" : event.reason,
         header: rebinding ? ctx.sessionManager.getHeader() : undefined,
         initialModel: rebinding && model ? { provider: model.provider, id: model.id, thinking: pi.getThinkingLevel() } : undefined,
-        onActivate: (appearance: string, focused?: boolean, held?: boolean) => {
+        onActivate: (appearance: string, focused?: boolean, held?: boolean, heldAt?: number) => {
           if (typeof focused === "boolean") setTerminalFocus(focused);
           prefixHeld = false;
           inheritedPrefixHeld = held === true && terminalFocused;
-          setSelectorHeld(inheritedPrefixHeld);
+          setSelectorHeld(inheritedPrefixHeld, heldAt);
           hideTargets();
           // A background PTY cannot receive terminal palette replies. Re-query
           // on activation so Pi's native system theme matches the host terminal.
           ui?.handleTerminalInput?.(`\x1b[?997;${appearance === "light" ? "2" : "1"}n`);
           ui?.requestRender(true);
-        }, onModifier: (held: boolean) => {
+        }, onModifier: (held: boolean, heldAt?: number) => {
           inheritedPrefixHeld = held === true && terminalFocused;
-          setSelectorHeld(inheritedPrefixHeld);
+          setSelectorHeld(inheritedPrefixHeld, heldAt);
         } });
       if (waitForPaint) {
         const tui = ui, original = tui.renderNow, connection = bridge;

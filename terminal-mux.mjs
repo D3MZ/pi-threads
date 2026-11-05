@@ -29,7 +29,7 @@ function preparePty() {
 // owns the physical terminal; background Pi instances continue rendering into
 // their own PTYs and are asked for a complete repaint when selected again.
 export class TerminalMux {
-  constructor({ ui, onSwitch, onExit, onRebind, getAppearance, isFocused, onChildInput, isPrefixHeld }) {
+  constructor({ ui, onSwitch, onExit, onRebind, getAppearance, isFocused, onChildInput, isPrefixHeld, getPrefixHeldAt }) {
     this.ui = ui;
     this.onSwitch = onSwitch;
     this.onExit = onExit;
@@ -38,6 +38,7 @@ export class TerminalMux {
     this.isFocused = isFocused;
     this.onChildInput = onChildInput;
     this.isPrefixHeld = isPrefixHeld;
+    this.getPrefixHeldAt = getPrefixHeldAt;
     this.children = new Map();
     this.active = undefined;
     this.dir = mkdtempSync(join(tmpdir(), "pi-threads-"));
@@ -63,9 +64,9 @@ export class TerminalMux {
     };
     process.stdout.on("resize", this.onResize);
   }
-  bind(ui, onSwitch, onExit, getAppearance, isFocused, onChildInput, isPrefixHeld, onRebind) {
+  bind(ui, onSwitch, onExit, getAppearance, isFocused, onChildInput, isPrefixHeld, onRebind, getPrefixHeldAt) {
     this.ui = ui; this.onSwitch = onSwitch; this.onExit = onExit; this.onRebind = onRebind; this.getAppearance = getAppearance; this.isFocused = isFocused;
-    this.onChildInput = onChildInput; this.isPrefixHeld = isPrefixHeld;
+    this.onChildInput = onChildInput; this.isPrefixHeld = isPrefixHeld; this.getPrefixHeldAt = getPrefixHeldAt;
     if (!this.screenTransition) {
       this.screenTransition = new ScreenTransition(this); this.installOutput();
       const oldResize = this.onResize;
@@ -221,7 +222,7 @@ export class TerminalMux {
         else {
           // The host tracks physical focus and the held modifier while the
           // child owns input, so a newly activated thread inherits that state.
-          if (this.onChildInput?.(data)) this.send(child, { type: "modifier", prefixHeld: this.isPrefixHeld?.() === true });
+          if (this.onChildInput?.(data)) this.send(child, { type: "modifier", prefixHeld: this.isPrefixHeld?.() === true, prefixHeldAt: this.getPrefixHeldAt?.() });
           if (data === "\x1b[I" || data === "\x1b[O") this.input(data);
           if (child.negotiated) child.pty.write(data);
           else child.pendingInput.push(data);
@@ -235,7 +236,7 @@ export class TerminalMux {
     this.onResize();
     return this.screenTransition.show(child);
   }
-  activate(child) { this.send(child, { type: "activate", appearance: this.getAppearance?.(), focused: this.isFocused?.() !== false, prefixHeld: this.isPrefixHeld?.() === true }); }
+  activate(child) { this.send(child, { type: "activate", appearance: this.getAppearance?.(), focused: this.isFocused?.() !== false, prefixHeld: this.isPrefixHeld?.() === true, prefixHeldAt: this.getPrefixHeldAt?.() }); }
   showMain() { this.screenTransition.showMain(); }
   stop(session) {
     const child = this.children.get(session);
@@ -272,8 +273,8 @@ export function connectThread({ path, token, session, previousSession, reason, h
       let message; try { message = JSON.parse(buffer.slice(0, i)); } catch { socket.destroy(); return; }
       buffer = buffer.slice(i + 1);
       if (message.type === "ready") message.error ? rejectReady(new Error(message.error)) : resolveReady();
-      else if (message.type === "activate") onActivate(message.appearance, message.focused, message.prefixHeld);
-      else if (message.type === "modifier") onModifier?.(message.prefixHeld);
+      else if (message.type === "activate") onActivate(message.appearance, message.focused, message.prefixHeld, message.prefixHeldAt);
+      else if (message.type === "modifier") onModifier?.(message.prefixHeld, message.prefixHeldAt);
       else if (message.type === "response") {
         const request = pending.get(message.id);
         if (request) { pending.delete(message.id); message.error ? request.reject(new Error(message.error)) : request.resolve(); }
