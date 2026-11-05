@@ -6,7 +6,9 @@ import { performance } from "node:perf_hooks";
 import { loadTerminalMux } from "./terminal-mux-loader.mjs";
 import { isCloseShortcut, parseKeyboardEvent } from "./keyboard.ts";
 import { heartbeatBrightness, renderThreadIndicators, type ThreadIndicator } from "./thread-activity.ts";
-import { registerThreadWake, type ThreadWakeup } from "./thread-wake.ts";
+import { registerThreadWake, rememberThreadWakeups, type ThreadWakeup } from "./thread-wake.ts";
+import { finishDelegatedThread, registerThreadDelegation, type ThreadDelegation } from "./thread-delegation.ts";
+import { showThreadSettings } from "./thread-settings.ts";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -22,8 +24,8 @@ const extensionPath = fileURLToPath(import.meta.url);
 const legacyExtensionPath = fileURLToPath(new URL("./chatthreads.ts", import.meta.url));
 const defaults = { targets: "ctrl+;", prefix: "ctrl", previous: "ctrl+shift+left", next: "ctrl+shift+right", newThread: "ctrl+n", mainThread: "ctrl+shift+1" };
 type Config = typeof defaults;
-type Thread = { slot: string; session: string; title: string; pid?: number; tty?: string; terminalId?: string; parent?: string; entry?: string; reservedAt?: number; kind?: "rpc" | "tui"; kickoff?: string; working?: boolean; unread?: boolean; closed?: boolean; settledTurns?: number; lastSettledPid?: number; lastTurnAborted?: boolean; initialModel?: { provider: string; id: string; thinking: string } };
-type Group = { version: 1; root: string; threads: Thread[]; viewing?: string; wakeups?: ThreadWakeup[] };
+type Thread = { slot: string; session: string; title: string; pid?: number; tty?: string; terminalId?: string; parent?: string; entry?: string; reservedAt?: number; kind?: "rpc" | "tui"; kickoff?: string; delegation?: string; working?: boolean; unread?: boolean; closed?: boolean; settledTurns?: number; lastSettledPid?: number; lastTurnAborted?: boolean; initialModel?: { provider: string; id: string; thinking: string } };
+type Group = { version: 1; root: string; threads: Thread[]; viewing?: string; wakeups?: ThreadWakeup[]; delegations?: ThreadDelegation[] };
 type Target = { entry: string; boundary: string; title: string; slot: string };
 type TreePreview = (width: number, theme: ExtensionContext["ui"]["theme"]) => string[];
 type PendingTarget = Target & { preview: TreePreview };
@@ -453,8 +455,10 @@ export default async function (pi: ExtensionAPI) {
     return group?.threads.some(thread => thread.session === ctx.sessionManager.getSessionFile() && thread.closed) === true;
   }
   function getMux(ctx: ExtensionContext) {
-    const onSwitch = async (slot: string) => {
+    const onSwitch = async (slot: string, source?: string) => {
+      if (slot.startsWith("delegate-stop:")) { await controlDelegation(ctx, slot.slice(14), source, true); return; }
       if (closing) throw new Error("A thread is closing; please wait");
+      if (slot.startsWith("delegate-start:")) { await controlDelegation(ctx, slot.slice(15), source, false); return; }
       if (slot === "reopen-host") { await reopenHost(ctx); return; }
       if (slot.startsWith("close:")) {
         const child = mux?.active;
@@ -478,8 +482,12 @@ export default async function (pi: ExtensionAPI) {
       if (path) void locked(path, group => {
         const entry = group?.threads.find(t => t.session === session && (!t.pid || t.pid === pid));
         if (entry && group) {
+          const delegated = finishDelegatedThread(group, entry, pid);
+          if (delegated) rememberThreadWakeups(group, entry, pid);
           if (entry.working && group.viewing !== session) entry.unread = true;
-          delete entry.pid; delete entry.reservedAt; delete entry.working; writeGroup(path, group);
+          delete entry.pid; delete entry.reservedAt; delete entry.working;
+          if (delegated && closing !== session) group.threads = group.threads.filter(thread => thread !== entry);
+          writeGroup(path, group);
         }
       }).catch(() => {});
       if (active) {
@@ -518,6 +526,10 @@ export default async function (pi: ExtensionAPI) {
         const thread = group?.threads.find(t => t.session === previous);
         if (!group || !thread || group.root === previous || (thread.pid && thread.pid !== child.pty.pid)) throw new Error("This thread is no longer registered");
         if (group.threads.some(t => t !== thread && t.session === session)) throw new Error("That session is already open in another thread");
+        if (thread.delegation) {
+          if (finishDelegatedThread(group, thread, child.pty.pid)) rememberThreadWakeups(group, thread, child.pty.pid);
+          delete thread.delegation;
+        }
         thread.session = session;
         thread.pid = child.pty.pid;
         thread.title = message.reason === "new" ? "New session" : message.reason === "fork" ? "Forked session" : "Session";
@@ -549,11 +561,13 @@ export default async function (pi: ExtensionAPI) {
     await locked(path, group => {
       const entry = group?.threads.find(t => t.session === thread.session);
       if (!group || !entry) throw new Error("Thread is no longer registered");
+      const task = entry.delegation && group.delegations?.find(item => item.id === entry.delegation && item.session === entry.session);
+      if (entry.delegation && (!task || task.cancelled || task.state !== "running")) throw new Error("Delegated thread was cancelled");
       if (entry.pid && pidAlive(entry.pid)) throw new Error("This session is open in another Pi process; close it first");
       if (entry.reservedAt && Date.now() - entry.reservedAt < 120000) throw new Error("Thread is already starting");
       entry.reservedAt = Date.now(); writeGroup(path, group);
     });
-    const env = { ...process.env, PI_CODING_AGENT_DIR: getAgentDir(), PI_THREADS_GROUP: path, PI_CHATTHREADS_GROUP: path };
+    const env: NodeJS.ProcessEnv = { ...process.env, PI_CODING_AGENT_DIR: getAgentDir(), PI_THREADS_GROUP: path, PI_CHATTHREADS_GROUP: path };
     delete env.PI_SESSION_FILE; delete env.PI_SESSION_ID; delete env.PI_THREADS_KICKOFF; delete env.PI_CHATTHREADS_KICKOFF;
     if (thread.kickoff) env.PI_THREADS_KICKOFF = env.PI_CHATTHREADS_KICKOFF = thread.kickoff;
     // Let Pi restore the model and thinking level recorded in this fork,
@@ -574,6 +588,8 @@ export default async function (pi: ExtensionAPI) {
       await locked(path, group => {
         const entry = group?.threads.find(t => t.session === thread.session);
         if (!entry || !group) throw new Error("Thread is no longer registered");
+        const task = entry.delegation && group.delegations?.find(item => item.id === entry.delegation && item.session === entry.session);
+        if (entry.delegation && (!task || task.cancelled || task.state !== "running")) throw new Error("Delegated thread was cancelled");
         entry.pid = child.pty.pid; entry.kind = "tui"; delete entry.reservedAt; writeGroup(path, group);
       });
       return child;
@@ -585,6 +601,15 @@ export default async function (pi: ExtensionAPI) {
       });
       throw error;
     }
+  }
+  async function controlDelegation(ctx: ExtensionContext, id: string, source: string | undefined, stop: boolean) {
+    const group = groupFile && readGroup(groupFile);
+    const task = group?.delegations?.find(item => item.id === id && item.parent === source && item.state === "running");
+    const parent = task && group?.threads.find(thread => thread.session === task.parent && thread.pid === task.parentPid);
+    const thread = task && group?.threads.find(item => item.session === task.session && item.delegation === id);
+    if (!task || !parent || !thread || (!stop && task.cancelled)) throw new Error("Delegated thread is no longer available");
+    if (stop) mux?.stop(thread.session);
+    else await ensureTerminal(ctx, thread);
   }
   async function switchSlot(ctx: ExtensionContext, slot: string) {
     if (bridge) { await bridge.switch(slot); return; }
@@ -725,6 +750,7 @@ export default async function (pi: ExtensionAPI) {
         host.slot = ""; host.closed = true; delete host.working; delete host.unread;
         writeGroup(path, current);
       });
+      await delegation.cancelOwned(ctx);
       stopHostWork(ctx);
       refreshFooterSlots();
     } catch (e) {
@@ -1114,6 +1140,28 @@ export default async function (pi: ExtensionAPI) {
     ctx.ui.notify("Shortcuts saved. Run /reload to apply them.", "info");
   }
 
+  const delegation = registerThreadDelegation(pi, {
+    groupPath: () => groupFile,
+    ensureGroup: async ctx => {
+      if (!groupFile) await registerMe(ctx, true, !!childSocket);
+      if (!groupFile) throw new Error("Thread group is unavailable");
+      return groupFile;
+    },
+    readGroup, locked, writeGroup,
+    start: async (ctx, id) => {
+      if (childSocket) {
+        if (!bridge) throw new Error("The thread manager is not connected");
+        await bridge.switch(`delegate-start:${id}`);
+      } else await controlDelegation(ctx, id, ctx.sessionManager.getSessionFile(), false);
+    },
+    stop: async (ctx, id) => {
+      if (childSocket) {
+        if (!bridge) throw new Error("The thread manager is not connected");
+        await bridge.switch(`delegate-stop:${id}`);
+      } else await controlDelegation(ctx, id, ctx.sessionManager.getSessionFile(), true);
+    },
+  });
+
   function hostRegistryReady(ctx: ExtensionContext) {
     if (childSocket || !mux?.children.size) return true;
     const session = ctx.sessionManager.getSessionFile();
@@ -1383,7 +1431,7 @@ export default async function (pi: ExtensionAPI) {
           const thread = group?.threads.find(t => t.session === session && t.kickoff === kickoff);
           if (thread && group) { delete thread.kickoff; writeGroup(groupFile!, group); }
         });
-        setTimeout(() => pi.sendUserMessage(payload.message, { expandPromptTemplates: true }), 100);
+        setTimeout(() => pi.sendUserMessage(payload.message, { expandPromptTemplates: true, deliverAs: "followUp" }), 100);
       } catch (e) { ctx.ui.notify(`Could not send thread reply: ${errorText(e)}`, "error"); }
     }
   });
@@ -1452,6 +1500,7 @@ export default async function (pi: ExtensionAPI) {
         { value: "on", label: "on", description: "Open the thread target tree" },
         { value: "off", label: "off", description: "Cancel a pending thread reply" },
         { value: "show", label: "show", description: "Choose an existing thread" },
+        { value: "settings", label: "settings", description: "Configure thread settings" },
         { value: "keybinding", label: "keybinding", description: "Configure shortcuts" },
         ...visibleThreads(group).map(t => ({ value: t.slot, label: t.slot, description: `Switch to ${t.title}` })),
       ];
@@ -1464,13 +1513,14 @@ export default async function (pi: ExtensionAPI) {
       if (ctx.mode !== "tui") return;
       const command = args.trim();
       if (command === "keybinding") await settings(ctx);
+      else if (command === "settings") await showThreadSettings(ctx);
       else if (command === "show") await listThreads(ctx);
       else if (command === "on") await enableTargets(ctx);
       else if (command === "off") {
         if (creating) ctx.ui.notify("The new thread is starting", "warning");
         else { pending = undefined; hideTargets(); }
       } else if (/^[0-9]$/.test(command)) await switchOrCreate(ctx, command);
-      else ctx.ui.notify(`Open tree: short tap ${config.prefix}, ${config.targets}, or /threads on. Switch or create: ${config.prefix}+number or /threads <number>. Swarm: hold ctrl+s+number (Kitty keyboard). Also: /threads off, show, keybinding.`, command ? "warning" : "info");
+      else ctx.ui.notify(`Open tree: short tap ${config.prefix}, ${config.targets}, or /threads on. Switch or create: ${config.prefix}+number or /threads <number>. Swarm: hold ctrl+s+number (Kitty keyboard). Also: /threads off, show, settings, keybinding.`, command ? "warning" : "info");
     },
   });
   pi.registerShortcut(config.targets as any, { description: "Open the thread target tree", handler: toggleTargets });

@@ -13,6 +13,7 @@ export type ThreadWakeup = {
   slot: string;
   after: number;
   note?: string;
+  outcome?: "settled" | "aborted";
 };
 
 type WakeThread = {
@@ -47,6 +48,13 @@ type Monitor = {
 type Delivery = { wake: ThreadWakeup; outcome: "settled" | "aborted" | "unavailable"; working: boolean };
 
 const count = (thread: WakeThread) => Number.isSafeInteger(thread.settledTurns) && thread.settledTurns! >= 0 ? thread.settledTurns! : 0;
+
+export function rememberThreadWakeups(group: WakeGroup, thread: WakeThread, pid: number) {
+  for (const wake of group.wakeups || []) {
+    if (wake.target !== thread.session || wake.targetPid !== pid || count(thread) <= wake.after || thread.lastSettledPid !== pid) continue;
+    wake.outcome = count(thread) === wake.after + 1 && thread.lastTurnAborted ? "aborted" : "settled";
+  }
+}
 
 export function registerThreadWake<G extends WakeGroup>(pi: ExtensionAPI, helpers: Helpers<G>) {
   let active: { session: string; path?: string; ctx: ExtensionContext } | undefined;
@@ -118,7 +126,9 @@ export function registerThreadWake<G extends WakeGroup>(pi: ExtensionAPI, helper
         if (wake.requester !== state.session || wake.requesterPid !== process.pid) { keep.push(wake); continue; }
         const target = group.threads.find(t => t.session === wake.target);
         let outcome: Delivery["outcome"] | undefined;
-        if (target && count(target) > wake.after && (target.lastSettledPid === wake.targetPid || (target.lastSettledPid === undefined && target.pid === wake.targetPid))) {
+        if (wake.outcome) {
+          outcome = wake.outcome;
+        } else if (target && count(target) > wake.after && (target.lastSettledPid === wake.targetPid || (target.lastSettledPid === undefined && target.pid === wake.targetPid))) {
           outcome = count(target) === wake.after + 1 && target.lastTurnAborted ? "aborted" : "settled";
         } else if (!target || target.closed || target.pid !== wake.targetPid || !helpers.pidAlive(wake.targetPid)) {
           outcome = "unavailable";

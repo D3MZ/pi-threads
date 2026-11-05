@@ -144,7 +144,7 @@ export class TerminalMux {
         } else if (message.type === "painted") {
           handshake.then(() => { child.screenReady = true; this.screenTransition?.connected(child); }).catch(() => {});
         } else if (message.type === "switch" && typeof message.slot === "string") {
-          handshake.then(() => this.onSwitch(message.slot)).then(
+          handshake.then(() => this.onSwitch(message.slot, child.session)).then(
             () => this.send(child, { type: "response", id: message.id }),
             e => this.send(child, { type: "response", id: message.id, error: e instanceof Error ? e.message : String(e) }),
           );
