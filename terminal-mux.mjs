@@ -42,7 +42,7 @@ export class TerminalMux {
     this.active = undefined;
     this.dir = mkdtempSync(join(tmpdir(), "pi-threads-"));
     this.path = process.platform === "win32"
-      ? `\\\\.\\pipe\\pi-chatthreads-${process.pid}-${randomBytes(12).toString("hex")}`
+      ? `\\\\.\\pipe\\pi-threads-${process.pid}-${randomBytes(12).toString("hex")}`
       : join(this.dir, "s");
     this.server = createServer(socket => this.accept(socket));
     this.ready = new Promise((resolve, reject) => {
@@ -159,7 +159,8 @@ export class TerminalMux {
     const old = this.children.get(session);
     if (old) { await old.ready; return old; }
     const token = randomBytes(24).toString("hex");
-    const childEnv = { ...env, PI_CHATTHREADS_SOCKET: this.path, PI_CHATTHREADS_TOKEN: token };
+    // Preserve the legacy names for children launched across an upgrade.
+    const childEnv = { ...env, PI_THREADS_SOCKET: this.path, PI_THREADS_TOKEN: token, PI_CHATTHREADS_SOCKET: this.path, PI_CHATTHREADS_TOKEN: token };
     const pty = preparePty().spawn(executable, args, {
       cwd, env: childEnv, name: process.env.TERM || "xterm-256color",
       cols: Math.max(1, this.ui.terminal.columns), rows: Math.max(1, this.ui.terminal.rows),

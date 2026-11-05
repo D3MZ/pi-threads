@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 
 const [path, token] = process.argv.slice(2);
 if (!path || !token) {
-  console.error("Chat thread launch information is missing.");
+  console.error("Pi Threads launch information is missing.");
   process.exit(1);
 }
 const socket = createConnection(path);
@@ -32,12 +32,12 @@ socket.on("data", chunk => {
       throw new Error("Could not replace the launcher process");
     }
     const child = spawn(payload.executable, payload.args, { stdio: "inherit", env });
-    child.on("error", error => { console.error(`Chat thread launch failed: ${error.message}`); process.exitCode = 1; });
+    child.on("error", error => { console.error(`Pi Threads launch failed: ${error.message}`); process.exitCode = 1; });
     child.on("exit", (code, signal) => { process.exitCode = code ?? (signal ? 1 : 0); });
   } catch (error) {
-    console.error(`Chat thread launch failed: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`Pi Threads launch failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
   }
 });
-socket.on("error", error => { console.error(`Chat thread launch failed: ${error.message}`); process.exitCode = 1; });
-socket.on("end", () => { if (!received) { console.error("Chat thread launch was cancelled."); process.exitCode = 1; } });
+socket.on("error", error => { console.error(`Pi Threads launch failed: ${error.message}`); process.exitCode = 1; });
+socket.on("end", () => { if (!received) { console.error("Pi Threads launch was cancelled."); process.exitCode = 1; } });

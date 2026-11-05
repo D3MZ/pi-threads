@@ -8,7 +8,7 @@
   },
   "keywords": ["pi-package"],
   "pi": {
-    "extensions": ["./chatthreads.ts"]
+    "extensions": ["./threads.ts"]
   },
   "dependencies": {
     "node-pty": "^1.1.0"
