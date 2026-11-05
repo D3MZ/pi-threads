@@ -22,7 +22,7 @@ export type ThreadDelegation = {
   settled?: Result;
   result?: Result;
 };
-type DelegatedThread = { slot: string; session: string; title: string; pid?: number; closed?: boolean; kickoff?: string; delegation?: string };
+type DelegatedThread = { slot: string; session: string; title: string; pid?: number; closed?: boolean; kickoff?: string; delegation?: string; initialModel?: { provider: string; id: string; thinking: string } };
 type DelegationGroup = { threads: DelegatedThread[]; delegations?: ThreadDelegation[] };
 type Helpers<G extends DelegationGroup> = {
   groupPath(): string | undefined;
@@ -261,7 +261,9 @@ export function registerThreadDelegation<G extends DelegationGroup>(pi: Extensio
           mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
           kickoff = join(dirname(path), `kickoff-${randomUUID()}.json`);
           writeFileSync(kickoff, JSON.stringify({ session: child, message }), { mode: 0o600, flag: "wx" });
-          group.threads.push({ slot, session: child, title: "Delegated task", kickoff, delegation: id });
+          const model = ctx.model;
+          group.threads.push({ slot, session: child, title: "Delegated task", kickoff, delegation: id,
+            ...(model ? { initialModel: { provider: model.provider, id: model.id, thinking: pi.getThinkingLevel() } } : {}) });
           (group.delegations ||= []).push({ id, parent: origin!, parentPid: process.pid, session: child, slot, leafId: pointer.contextLeafId,
             notifyOnCompletion: args.notifyOnCompletion, returnLastResponse: args.returnLastResponse ?? false, state: "running" });
           helpers.writeGroup(path, group);
@@ -312,7 +314,9 @@ export function registerThreadDelegation<G extends DelegationGroup>(pi: Extensio
       let callback = callbacks.get(args.id);
       if (callback && (callback.origin !== origin || (callback.leafId && !branch.some(entry => entry.id === callback!.leafId)))) callback = undefined;
       const saved = [...branch].reverse().find((entry: any) => entry.type === "custom_message" && entry.customType === resultType && entry.details?.id === args.id) as any;
-      if (callback?.result && !saved) callback = undefined;
+      // A queued completion may not be persisted yet; only reject one saved on another branch.
+      if (callback?.result && !saved && ctx.sessionManager.getEntries().some((entry: any) =>
+        entry.type === "custom_message" && entry.customType === resultType && entry.details?.id === args.id)) callback = undefined;
       if (!callback && saved?.details) callback = { origin: origin!, result: saved.details as Result, returnLastResponse: false, delivered: false };
       const path = helpers.groupPath();
       if (!callback && path && origin) {
