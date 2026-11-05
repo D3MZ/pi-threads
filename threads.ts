@@ -10,6 +10,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const slots = "1234567890";
+const swarmPrompt = "Swarm agent: Peak into recent active pi logs in this project and do the non overlapping tasks ahead from the actively working agents. The other members will be able to read your logs to do the same and do non overlapping tasks such that you'll all eventually self organize until the active tasks are completed. If there are no active tasks, or the active tasks don't have a clear future task that needs to be done, then do nothing. For example, if an active task requires both back and front end development, and you see one agent only working on the backend, then you can start working on the front end portion. It's important that you follow the same paradigms as the other agents in the swarm so your code gets automatically discovered to prompt the other agent to see your own logs so they can also plan around you.";
 const tapDurationMs = 300;
 const directory = join(getAgentDir(), "pi-threads");
 // Keep old registries in place so live threads continue sharing the same locks.
@@ -232,6 +233,8 @@ export default async function (pi: ExtensionAPI) {
   let selectorHeld = false;
   let selectorHeldAt = 0;
   let prefixTapStartedAt: number | undefined;
+  let swarmKey: { raw: string; used: boolean } | undefined;
+  let replayingSwarmKey = false;
   let closePicker: (() => void) | undefined;
   let pickerTargets: (() => Map<string, Target>) | undefined;
   let pickerPreview: ((target: Target) => TreePreview | undefined) | undefined;
@@ -402,6 +405,14 @@ export default async function (pi: ExtensionAPI) {
     return !!focused && focused === ui?.children?.[4]?.children?.[0]
       && typeof focused.getText === "function" && typeof focused.setText === "function";
   }
+  function replaySwarmKey() {
+    const key = swarmKey;
+    swarmKey = undefined;
+    if (!key || key.used || !terminalFocused) return;
+    replayingSwarmKey = true;
+    try { ui?.handleTerminalInput(key.raw); }
+    finally { replayingSwarmKey = false; }
+  }
   async function registerMe(ctx: ExtensionContext, create: boolean, allowUnsaved = false) {
     const session = ctx.sessionManager.getSessionFile();
     if (!session || (!allowUnsaved && !existsSync(session))) throw new UnsavedSessionError("A saved Pi session is required");
@@ -480,6 +491,7 @@ export default async function (pi: ExtensionAPI) {
     const isFocused = () => terminalFocused;
     const onChildInput = (data: string) => {
       const key = parseKeyboardEvent(data);
+      if (swarmKey && key && ((key.modifierKey && (key.modifiers & 4) === 0) || (key.code === 115 && key.event === 3))) swarmKey = undefined;
       if (!terminalFocused || !key?.modifierKey) return false;
       const held = (key.modifiers & prefixMask) === prefixMask;
       const changed = prefixHeld !== held;
@@ -767,6 +779,7 @@ export default async function (pi: ExtensionAPI) {
   function setTerminalFocus(focused: boolean) {
     if (terminalFocused === focused) return;
     terminalFocused = focused;
+    swarmKey = undefined;
     setPrefixHeld(false); prefixTapStartedAt = undefined;
     updateViewing();
     if (!targetMode) generation++;
@@ -1019,18 +1032,22 @@ export default async function (pi: ExtensionAPI) {
       throw new Error(`${errorText(e)}${child ? `; fork${message !== undefined ? " and reply" : ""} saved at ${child}` : ""}`);
     }
   }
-  async function newSessionThread(ctx: ExtensionContext, requestedSlot?: string) {
-    if (ctx.mode !== "tui" || replyBlocksSelection(ctx)) return;
+  async function newSessionThread(ctx: ExtensionContext, requestedSlot?: string, message?: string) {
+    if (ctx.mode !== "tui" || closing || replyBlocksSelection(ctx)) return;
     hideTargets();
     creating = true;
     let child = "";
+    let kickoff = "";
     let registered = false;
     try {
       if (!groupFile) await registerMe(ctx, true, true);
       const slot = await locked(groupFile!, group => {
         if (!group) throw new Error("Thread registry disappeared");
         const existing = requestedSlot ? group.threads.find(t => t.slot === requestedSlot) : undefined;
-        if (existing && !missingThread(ctx, group, existing)) return existing.slot;
+        if (existing && !missingThread(ctx, group, existing)) {
+          if (message !== undefined) throw new Error(`Thread ${existing.slot} is already in use; choose an empty slot`);
+          return existing.slot;
+        }
         const slot = requestedSlot || [...slots].find(s => !visibleThreads(group).some(t => t.slot === s));
         if (!slot) throw new Error("All thread slots are in use");
         if (existing?.kickoff && existsSync(existing.kickoff)) throw new Error(`Thread ${slot} has an unsent reply; its missing session was not replaced`);
@@ -1042,8 +1059,13 @@ export default async function (pi: ExtensionAPI) {
         // the header so this empty session can be switched to immediately.
         writeFileSync(path, `${JSON.stringify(header)}\n`, { mode: 0o600, flag: "wx" });
         child = path;
+        if (message !== undefined) {
+          ensureDir();
+          kickoff = join(directory, `kickoff-${randomUUID()}.json`);
+          writeFileSync(kickoff, JSON.stringify({ session: child, message }), { mode: 0o600, flag: "wx" });
+        }
         const model = ctx.model;
-        const thread: Thread = { slot, session: child, title: "New session", ...(model ? { initialModel: { provider: model.provider, id: model.id, thinking: pi.getThinkingLevel() } } : {}) };
+        const thread: Thread = { slot, session: child, title: message !== undefined ? "Swarm agent" : "New session", ...(kickoff ? { kickoff } : {}), ...(model ? { initialModel: { provider: model.provider, id: model.id, thinking: pi.getThinkingLevel() } } : {}) };
         if (existing) group.threads.splice(group.threads.indexOf(existing), 1, thread);
         else group.threads.push(thread);
         writeGroup(groupFile!, group);
@@ -1052,7 +1074,10 @@ export default async function (pi: ExtensionAPI) {
       });
       await switchSlot(ctx, slot);
     } catch (e) {
-      if (child && !registered) { try { unlinkSync(child); } catch {} }
+      if (!registered) {
+        if (child) { try { unlinkSync(child); } catch {} }
+        if (kickoff) { try { unlinkSync(kickoff); } catch {} }
+      }
       notifyThreadFailure(ctx, e, "Could not open thread");
     } finally { creating = false; }
   }
@@ -1137,6 +1162,7 @@ export default async function (pi: ExtensionAPI) {
     keyboardTimer = setInterval(tick, 250);
     keyboardTimer.unref();
     unsubscribeInput = ctx.ui.onTerminalInput(raw => {
+      if (replayingSwarmKey) return;
       // Fullscreen consumes these itself; regular mode must not pass them to the editor.
       if (raw === "\x1b[I" || raw === "\x1b[O") return { consume: true };
       const key = parseKeyboardEvent(raw);
@@ -1144,6 +1170,7 @@ export default async function (pi: ExtensionAPI) {
       if (key?.modifierKey) {
         // Ghostty can send modifier-only events to background tabs.
         if (!terminalFocused) return { consume: true };
+        if (swarmKey && (key.modifiers & (1 | 2 | 4 | 8 | 16 | 32)) !== 4) replaySwarmKey();
         const active = (key.modifiers & prefixMask) === prefixMask;
         inheritedPrefixHeld = active;
         setSelectorHeld(active);
@@ -1163,6 +1190,30 @@ export default async function (pi: ExtensionAPI) {
       }
       // Any other key while the modifier is held makes it a shortcut, not a tap.
       if (prefixHeld) prefixTapStartedAt = undefined;
+      // Defer Ctrl+S until release so its existing binding still works without firing during the chord.
+      if (swarmKey && key?.code === 115) {
+        if (key.event === 3) {
+          const held = swarmKey; swarmKey = undefined;
+          return held.used ? { consume: true } : { data: held.raw };
+        }
+        if (key.event === 2) return { consume: true };
+      }
+      if (key?.code === 115 && key.event === 1 && key.modifiers === 4 && terminalFocused && ui?.terminal?.kittyProtocolActive
+        && (editorFocused() || (targetMode && pickerCapturesInput?.()))) {
+        swarmKey = { raw, used: false };
+        return { consume: true };
+      }
+      if (swarmKey && !isKeyRelease(data)) {
+        const slot = [...slots].find(s => matchesKey(data, `ctrl+${s}` as any) || matchesKey(data, s as any));
+        if (slot) {
+          if (!key || key.event === 1) {
+            swarmKey.used = true;
+            void newSessionThread(ctx, slot, swarmPrompt);
+          }
+          return { consume: true };
+        }
+        replaySwarmKey();
+      }
       if (isKeyRelease(data)) return data !== raw ? { data } : undefined;
       if (isCloseShortcut(raw)) {
         if (bridge && childToken) {
@@ -1235,6 +1286,7 @@ export default async function (pi: ExtensionAPI) {
         initialModel: rebinding && model ? { provider: model.provider, id: model.id, thinking: pi.getThinkingLevel() } : undefined,
         onActivate: (appearance: string, focused?: boolean, held?: boolean, heldAt?: number) => {
           if (typeof focused === "boolean") setTerminalFocus(focused);
+          swarmKey = undefined;
           prefixHeld = false;
           inheritedPrefixHeld = held === true && terminalFocused;
           setSelectorHeld(inheritedPrefixHeld, heldAt);
@@ -1358,7 +1410,7 @@ export default async function (pi: ExtensionAPI) {
         if (creating) ctx.ui.notify("The new thread is starting", "warning");
         else { pending = undefined; hideTargets(); }
       } else if (/^[0-9]$/.test(command)) await switchOrCreate(ctx, command);
-      else ctx.ui.notify(`Open tree: short tap ${config.prefix}, ${config.targets}, or /threads on. Switch or create: ${config.prefix}+number or /threads <number>. Also: /threads off, show, keybinding.`, command ? "warning" : "info");
+      else ctx.ui.notify(`Open tree: short tap ${config.prefix}, ${config.targets}, or /threads on. Switch or create: ${config.prefix}+number or /threads <number>. Swarm: hold ctrl+s+number (Kitty keyboard). Also: /threads off, show, keybinding.`, command ? "warning" : "info");
     },
   });
   pi.registerShortcut(config.targets as any, { description: "Open the thread target tree", handler: toggleTargets });
