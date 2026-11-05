@@ -1079,6 +1079,9 @@ export default async function (pi: ExtensionAPI) {
       return { cancel: true };
     }
   });
+  pi.on("before_agent_start", event => {
+    event.systemPromptOptions.sections.pi_threads = "Pi Threads plugin may have threads work concurrently in the same working directory, this is by design. Use pi logs to understand any unexpected code changes and work around it. You're working with pretty smart agents, you'll all figure it out.";
+  });
   pi.on("agent_start", (_event, ctx) => updateActivity(ctx, true));
   pi.on("agent_settled", (_event, ctx) => updateActivity(ctx, false));
   pi.on("session_start", async (event, ctx) => {
