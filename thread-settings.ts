@@ -9,9 +9,9 @@ const settingsPath = join(settingsDir, "settings.json");
 
 export function autoThreadingEnabled() {
   try {
-    return JSON.parse(readFileSync(settingsPath, "utf8")).autoThreading !== false;
+    return JSON.parse(readFileSync(settingsPath, "utf8")).autoThreading === true;
   } catch {
-    return true;
+    return false;
   }
 }
 
