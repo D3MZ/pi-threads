@@ -303,6 +303,14 @@ export default async function (pi: ExtensionAPI) {
     inheritedPrefixHeld = held;
     setSelectorHeld(held);
   }
+  function isThreadSwitchInput(raw: string) {
+    const key = parseKeyboardEvent(raw);
+    if (key && key.event !== 1) return false;
+    const data = key?.normalized || raw;
+    return [...slots].some(slot => matchesKey(data, `${config.prefix}+${slot}` as any)
+      || ((prefixHeld || inheritedPrefixHeld) && matchesKey(data, slot as any)))
+      || [config.previous, config.next, config.newThread, config.mainThread].some(shortcut => matchesKey(data, shortcut as any));
+  }
   function refreshFooterSlots() {
     const group = groupFile && readGroup(groupFile);
     const list = visibleThreads(group).sort((a, b) => slots.indexOf(a.slot) - slots.indexOf(b.slot));
@@ -456,8 +464,24 @@ export default async function (pi: ExtensionAPI) {
   }
   function getMux(ctx: ExtensionContext) {
     const onSwitch = async (slot: string, source?: string) => {
+      if (slot === "input-pass") {
+        const child = source && mux?.children.get(source);
+        if (child) mux?.passChildInput(child);
+        return;
+      }
+      if (slot === "input-release") {
+        const child = source && mux?.children.get(source);
+        if (child && mux?.releaseChildInput(child)) throw new Error("Input typed while opening the thread was discarded.");
+        return;
+      }
       if (slot.startsWith("delegate-stop:")) { await controlDelegation(ctx, slot.slice(14), source, true); return; }
       if (closing) throw new Error("A thread is closing; please wait");
+      if (slot === "input-hold") {
+        const child = source && mux?.children.get(source);
+        if (!child || mux?.screenTransition?.inputTarget() !== child) throw new Error("This thread is no longer active");
+        mux.holdChildInput(child);
+        return;
+      }
       if (slot.startsWith("delegate-start:")) { await controlDelegation(ctx, slot.slice(15), source, false); return; }
       if (slot === "reopen-host") { await reopenHost(ctx); return; }
       if (slot.startsWith("close:")) {
@@ -542,13 +566,13 @@ export default async function (pi: ExtensionAPI) {
       });
       if (selectedSession === previous) { selectedSession = session; refreshMode(); }
     };
-    if (!mux) shared[muxKey] = mux = new TerminalMux({ ui, onSwitch, onExit, onRebind, getAppearance, isFocused, onChildInput, isPrefixHeld, getPrefixHeldAt });
+    if (!mux) shared[muxKey] = mux = new TerminalMux({ ui, onSwitch, onExit, onRebind, getAppearance, isFocused, onChildInput, isPrefixHeld, getPrefixHeldAt, shouldHoldChildInput: isThreadSwitchInput });
     else {
       // Reload preserves live PTYs; upgrade their manager and input routing too.
       const upgrading = Object.getPrototypeOf(mux) !== TerminalMux.prototype;
       Object.setPrototypeOf(mux, TerminalMux.prototype);
       if (upgrading) mux.detachInput();
-      mux.bind(ui, onSwitch, onExit, getAppearance, isFocused, onChildInput, isPrefixHeld, onRebind, getPrefixHeldAt);
+      mux.bind(ui, onSwitch, onExit, getAppearance, isFocused, onChildInput, isPrefixHeld, onRebind, getPrefixHeldAt, isThreadSwitchInput);
       if (mux.active) mux.installInput();
     }
     return mux;
@@ -615,39 +639,46 @@ export default async function (pi: ExtensionAPI) {
     if (bridge) { await bridge.switch(slot); return; }
     const request = ++focusGeneration;
     mux?.screenTransition?.cancel();
-    if (!groupFile) await registerMe(ctx, true);
-    const thread = readGroup(groupFile!)?.threads.find(t => t.slot === slot);
-    if (!thread || (thread.session !== ctx.sessionManager.getSessionFile() && !existsSync(thread.session) && !mux?.children.has(thread.session))) throw new Error(`Thread ${slot} is unavailable`);
-    hideTargets();
-    if (thread.session === ctx.sessionManager.getSessionFile()) {
-      selectedSession = thread.session; mux?.showMain(); updateViewing(); refreshMode(); return;
-    }
-    const previous = mux?.active;
-    const child = await ensureTerminal(ctx, thread);
-    if (request !== focusGeneration) return;
     const manager = getMux(ctx);
+    const hold = manager.holdInput();
     try {
-      const shown = await manager.show(child);
-      if (!shown || request !== focusGeneration || manager.active !== child || manager.children.get(child.session) !== child) return;
-      selectedSession = thread.session; updateViewing(); refreshMode();
-    } catch (e) {
-      if (request !== focusGeneration) return;
-      if (previous && manager.children.get(previous.session) === previous) {
-        try {
-          if (manager.active !== previous) await manager.show(previous);
-          if (request !== focusGeneration) return;
-          selectedSession = previous.session; updateViewing(); refreshMode();
-        } catch {
-          if (hostClosed(ctx)) { if (!closing && !recovering) void focusRemaining(ctx, thread.session); }
-          else { manager.showMain(); selectedSession = ctx.sessionManager.getSessionFile(); updateViewing(); refreshMode(); }
-        }
-      } else if (hostClosed(ctx)) {
-        if (!closing && !recovering) void focusRemaining(ctx, thread.session);
-      } else {
-        if (manager.active) manager.showMain();
-        selectedSession = ctx.sessionManager.getSessionFile(); updateViewing(); refreshMode();
+      if (!groupFile) await registerMe(ctx, true);
+      const thread = readGroup(groupFile!)?.threads.find(t => t.slot === slot);
+      if (!thread || (thread.session !== ctx.sessionManager.getSessionFile() && !existsSync(thread.session) && !manager.children.has(thread.session))) throw new Error(`Thread ${slot} is unavailable`);
+      hideTargets();
+      if (thread.session === ctx.sessionManager.getSessionFile()) {
+        selectedSession = thread.session; manager.showMain(); manager.releaseInput(hold, true); updateViewing(); refreshMode(); return;
       }
-      throw e;
+      const previous = manager.active;
+      const child = await ensureTerminal(ctx, thread);
+      if (request !== focusGeneration) return;
+      try {
+        const showing = manager.show(child);
+        manager.releaseInput(hold, true);
+        const shown = await showing;
+        if (!shown || request !== focusGeneration || manager.active !== child || manager.children.get(child.session) !== child) return;
+        selectedSession = thread.session; updateViewing(); refreshMode();
+      } catch (e) {
+        if (request !== focusGeneration) return;
+        if (previous && manager.children.get(previous.session) === previous) {
+          try {
+            if (manager.active !== previous) await manager.show(previous);
+            if (request !== focusGeneration) return;
+            selectedSession = previous.session; updateViewing(); refreshMode();
+          } catch {
+            if (hostClosed(ctx)) { if (!closing && !recovering) void focusRemaining(ctx, thread.session); }
+            else { manager.showMain(); selectedSession = ctx.sessionManager.getSessionFile(); updateViewing(); refreshMode(); }
+          }
+        } else if (hostClosed(ctx)) {
+          if (!closing && !recovering) void focusRemaining(ctx, thread.session);
+        } else {
+          if (manager.active) manager.showMain();
+          selectedSession = ctx.sessionManager.getSessionFile(); updateViewing(); refreshMode();
+        }
+        throw e;
+      }
+    } finally {
+      if (manager.releaseInput(hold, false)) ctx.ui.notify("Input typed while opening the thread was discarded.", "warning");
     }
   }
   async function reopenHost(ctx: ExtensionContext) {
@@ -1024,13 +1055,35 @@ export default async function (pi: ExtensionAPI) {
     if (targetMode) hideTargets();
     await focusSlot(ctx, slot);
   }
+  async function holdRemoteInput(connection: NonNullable<typeof bridge>) {
+    // When ready, send before the shortcut acknowledgement queued by the input handler.
+    if (!connection.supportsInputHold()) {
+      await connection.ready;
+      if (!connection.supportsInputHold()) return false;
+    }
+    try { await connection.switch("input-hold"); return true; }
+    catch (e) {
+      // A host that has not been reloaded yet does not know this request.
+      if (errorText(e) === "Thread input-hold is unavailable") return false;
+      throw e;
+    }
+  }
+  async function releaseRemoteInput(ctx: ExtensionContext, connection: NonNullable<typeof bridge>) {
+    try { await connection.switch("input-release"); }
+    catch (e) { ctx.ui.notify(errorText(e), "warning"); }
+  }
   async function createThread(ctx: ExtensionContext, target?: Target, message?: Reply) {
     const session = ctx.sessionManager.getSessionFile();
     if (!session || !groupFile) throw new Error("Thread parent is no longer available");
     const path = groupFile;
     let selected = target;
     let child = "";
+    let inputManager: any, inputHold: any;
+    const inputBridge = bridge;
+    let remoteInputHeld = false;
     try {
+      if (!childSocket) { inputManager = getMux(ctx); inputHold = inputManager.holdInput(); }
+      else if (inputBridge) remoteInputHeld = await holdRemoteInput(inputBridge);
       await locked(path, group => {
         if (!group) throw new Error("Thread registry disappeared");
         const activeBranch = ctx.sessionManager.getBranch() as Entry[];
@@ -1067,6 +1120,9 @@ export default async function (pi: ExtensionAPI) {
       await switchSlot(ctx, selected!.slot);
     } catch (e) {
       throw new Error(`${errorText(e)}${child ? `; fork${message !== undefined ? " and reply" : ""} saved at ${child}` : ""}`);
+    } finally {
+      if (inputManager?.releaseInput(inputHold, false)) ctx.ui.notify("Input typed while opening the thread was discarded.", "warning");
+      if (remoteInputHeld && inputBridge) await releaseRemoteInput(ctx, inputBridge);
     }
   }
   async function newSessionThread(ctx: ExtensionContext, requestedSlot?: string, message?: string) {
@@ -1076,7 +1132,12 @@ export default async function (pi: ExtensionAPI) {
     let child = "";
     let kickoff = "";
     let registered = false;
+    let inputManager: any, inputHold: any;
+    const inputBridge = bridge;
+    let remoteInputHeld = false;
     try {
+      if (!childSocket) { inputManager = getMux(ctx); inputHold = inputManager.holdInput(); }
+      else if (inputBridge) remoteInputHeld = await holdRemoteInput(inputBridge);
       if (!groupFile) await registerMe(ctx, true, true);
       const slot = await locked(groupFile!, group => {
         if (!group) throw new Error("Thread registry disappeared");
@@ -1116,7 +1177,11 @@ export default async function (pi: ExtensionAPI) {
         if (kickoff) { try { unlinkSync(kickoff); } catch {} }
       }
       notifyThreadFailure(ctx, e, "Could not open thread");
-    } finally { creating = false; }
+    } finally {
+      if (inputManager?.releaseInput(inputHold, false)) ctx.ui.notify("Input typed while opening the thread was discarded.", "warning");
+      if (remoteInputHeld && inputBridge) await releaseRemoteInput(ctx, inputBridge);
+      creating = false;
+    }
   }
   async function settings(ctx: ExtensionContext) {
     const choices = ["Open thread tree shortcut", "Thread modifier prefix", "Previous thread shortcut", "Next thread shortcut", "New thread shortcut", "Thread 1 shortcut", "Restore defaults"];
@@ -1243,6 +1308,11 @@ export default async function (pi: ExtensionAPI) {
     keyboardTimer.unref();
     unsubscribeInput = ctx.ui.onTerminalInput(raw => {
       if (replayingSwarmKey) return;
+      if (bridge?.supportsInputHold() && isThreadSwitchInput(raw)) {
+        const connection = bridge;
+        // A real switch is sent synchronously below, before this acknowledgement.
+        queueMicrotask(() => { void connection.switch("input-pass").catch(() => {}); });
+      }
       // Fullscreen consumes these itself; regular mode must not pass them to the editor.
       if (raw === "\x1b[I" || raw === "\x1b[O") return { consume: true };
       const key = parseKeyboardEvent(raw);

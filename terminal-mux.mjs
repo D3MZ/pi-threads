@@ -29,7 +29,7 @@ function preparePty() {
 // owns the physical terminal; background Pi instances continue rendering into
 // their own PTYs and are asked for a complete repaint when selected again.
 export class TerminalMux {
-  constructor({ ui, onSwitch, onExit, onRebind, getAppearance, isFocused, onChildInput, isPrefixHeld, getPrefixHeldAt }) {
+  constructor({ ui, onSwitch, onExit, onRebind, getAppearance, isFocused, onChildInput, isPrefixHeld, getPrefixHeldAt, shouldHoldChildInput }) {
     this.ui = ui;
     this.onSwitch = onSwitch;
     this.onExit = onExit;
@@ -39,6 +39,7 @@ export class TerminalMux {
     this.onChildInput = onChildInput;
     this.isPrefixHeld = isPrefixHeld;
     this.getPrefixHeldAt = getPrefixHeldAt;
+    this.shouldHoldChildInput = shouldHoldChildInput;
     this.children = new Map();
     this.active = undefined;
     this.dir = mkdtempSync(join(tmpdir(), "pi-threads-"));
@@ -64,9 +65,9 @@ export class TerminalMux {
     };
     process.stdout.on("resize", this.onResize);
   }
-  bind(ui, onSwitch, onExit, getAppearance, isFocused, onChildInput, isPrefixHeld, onRebind, getPrefixHeldAt) {
+  bind(ui, onSwitch, onExit, getAppearance, isFocused, onChildInput, isPrefixHeld, onRebind, getPrefixHeldAt, shouldHoldChildInput) {
     this.ui = ui; this.onSwitch = onSwitch; this.onExit = onExit; this.onRebind = onRebind; this.getAppearance = getAppearance; this.isFocused = isFocused;
-    this.onChildInput = onChildInput; this.isPrefixHeld = isPrefixHeld; this.getPrefixHeldAt = getPrefixHeldAt;
+    this.onChildInput = onChildInput; this.isPrefixHeld = isPrefixHeld; this.getPrefixHeldAt = getPrefixHeldAt; this.shouldHoldChildInput = shouldHoldChildInput;
     if (!this.screenTransition) {
       this.screenTransition = new ScreenTransition(this); this.installOutput();
       const oldResize = this.onResize;
@@ -108,10 +109,11 @@ export class TerminalMux {
           const previous = child.session;
           const attach = () => {
             if (socket.destroyed) throw new Error("Thread connection closed");
+            if (child.socket && child.socket !== socket) this.releaseChildInput(child);
             child.socket?.destroy(); child.socket = socket;
             child.screenReady = message.waitForPaint !== true;
             child.resolveReady();
-            this.send(child, { type: "ready" });
+            this.send(child, { type: "ready", inputHold: true });
             if (this.active === child) this.activate(child);
             else this.screenTransition?.connected(child);
           };
@@ -152,7 +154,9 @@ export class TerminalMux {
       }
     });
     socket.on("error", () => {});
-    socket.on("close", () => { if (child?.socket === socket) child.socket = undefined; });
+    socket.on("close", () => {
+      if (child?.socket === socket) { this.releaseChildInput(child); child.socket = undefined; }
+    });
   }
   send(child, message) { if (child.socket && !child.socket.destroyed) child.socket.write(`${JSON.stringify(message)}\n`); }
   async start({ session, executable, args, cwd, env }) {
@@ -217,6 +221,13 @@ export class TerminalMux {
       this.terminal = terminal;
       this.input = terminal.inputHandler;
       this.inputWrapper = data => {
+        if (this.inputHold) {
+          // Keep focus and modifier state current while the destination starts.
+          this.onChildInput?.(data);
+          if (data === "\x1b[I" || data === "\x1b[O") this.input(data);
+          this.inputHold.data.push(data);
+          return;
+        }
         const child = this.screenTransition ? this.screenTransition.inputTarget() : this.active;
         if (!child) this.input(data);
         else {
@@ -224,12 +235,56 @@ export class TerminalMux {
           // child owns input, so a newly activated thread inherits that state.
           if (this.onChildInput?.(data)) this.send(child, { type: "modifier", prefixHeld: this.isPrefixHeld?.() === true, prefixHeldAt: this.getPrefixHeldAt?.() });
           if (data === "\x1b[I" || data === "\x1b[O") this.input(data);
+          const prepare = this.shouldHoldChildInput?.(data) === true;
           if (child.negotiated) child.pty.write(data);
           else child.pendingInput.push(data);
+          if (prepare) this.prepareChildInput(child);
         }
       };
       terminal.inputHandler = this.inputWrapper;
     }
+  }
+  holdInput() {
+    this.installInput();
+    const hold = { data: this.inputHold?.data || [] };
+    this.inputHold = hold;
+    return hold;
+  }
+  releaseInput(hold, deliver) {
+    if (this.inputHold !== hold) return false;
+    this.inputHold = undefined;
+    clearTimeout(hold.timer);
+    if (deliver) for (const data of hold.data) this.inputWrapper(data);
+    return !deliver && hold.data.length > 0;
+  }
+  prepareChildInput(child) {
+    if (this.inputHold || child.inputHold) return;
+    const hold = this.holdInput();
+    hold.speculative = true;
+    child.inputHold = hold;
+    // Older children do not acknowledge shortcuts; never block them indefinitely.
+    hold.timer = setTimeout(() => this.passChildInput(child, hold), 1500);
+  }
+  passChildInput(child, hold = child.inputHold) {
+    if (!hold?.speculative || child.inputHold !== hold) return;
+    child.inputHold = undefined; clearTimeout(hold.timer);
+    const current = this.children.get(child.session) === child && this.screenTransition?.inputTarget() === child;
+    this.releaseInput(hold, current);
+  }
+  holdChildInput(child) {
+    const hold = child.inputHold;
+    if (hold && this.inputHold === hold) {
+      if (!hold.speculative) throw new Error("Thread input is already held");
+      hold.speculative = false; clearTimeout(hold.timer);
+      return;
+    }
+    child.inputHold = this.holdInput();
+  }
+  releaseChildInput(child) {
+    const hold = child.inputHold;
+    child.inputHold = undefined;
+    if (hold) clearTimeout(hold.timer);
+    return hold ? this.releaseInput(hold, false) : false;
   }
   show(child) {
     this.installInput();
@@ -243,6 +298,11 @@ export class TerminalMux {
     if (child) child.pty.kill();
   }
   detachInput() {
+    this.inputHold = undefined;
+    for (const child of this.children.values()) {
+      if (child.inputHold) clearTimeout(child.inputHold.timer);
+      child.inputHold = undefined;
+    }
     if (this.terminal && this.terminal.inputHandler === this.inputWrapper) this.terminal.inputHandler = this.input;
     this.terminal = undefined; this.input = undefined; this.inputWrapper = undefined;
   }
@@ -262,7 +322,7 @@ export class TerminalMux {
 export function connectThread({ path, token, session, previousSession, reason, header, initialModel, waitForPaint, onActivate, onModifier }) {
   const socket = createConnection(path);
   socket.setEncoding("utf8");
-  let buffer = "", nextId = 0, resolveReady, rejectReady;
+  let buffer = "", nextId = 0, resolveReady, rejectReady, inputHold = false;
   const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
   ready.catch(() => {});
   const pending = new Map();
@@ -272,7 +332,10 @@ export function connectThread({ path, token, session, previousSession, reason, h
       const i = buffer.indexOf("\n"); if (i < 0) break;
       let message; try { message = JSON.parse(buffer.slice(0, i)); } catch { socket.destroy(); return; }
       buffer = buffer.slice(i + 1);
-      if (message.type === "ready") message.error ? rejectReady(new Error(message.error)) : resolveReady();
+      if (message.type === "ready") {
+        if (message.error) rejectReady(new Error(message.error));
+        else { inputHold = message.inputHold === true; resolveReady(); }
+      }
       else if (message.type === "activate") onActivate(message.appearance, message.focused, message.prefixHeld, message.prefixHeldAt);
       else if (message.type === "modifier") onModifier?.(message.prefixHeld, message.prefixHeldAt);
       else if (message.type === "response") {
@@ -289,6 +352,7 @@ export function connectThread({ path, token, session, previousSession, reason, h
   socket.write(`${JSON.stringify({ type: "hello", token, session, previousSession, reason, header, initialModel, waitForPaint })}\n`);
   return {
     ready,
+    supportsInputHold() { return inputHold; },
     painted() { if (!socket.destroyed) socket.write(`${JSON.stringify({ type: "painted" })}\n`); },
     switch(slot) {
       if (socket.destroyed) return Promise.reject(new Error("Thread manager disconnected"));
