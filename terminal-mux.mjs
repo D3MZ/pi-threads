@@ -54,6 +54,8 @@ export class TerminalMux {
     this.server.unref();
     this.output = process.stdout.write;
     this.owner = this;
+    // The host Pi has already started its TUI before it creates the mux.
+    this.hostPasteMode = { enabled: true, partial: "" };
     this.screenTransition = new ScreenTransition(this);
     this.installOutput();
     this.onResize = () => {
@@ -68,6 +70,11 @@ export class TerminalMux {
   bind(ui, onSwitch, onExit, getAppearance, isFocused, onChildInput, isPrefixHeld, onRebind, getPrefixHeldAt, shouldHoldChildInput) {
     this.ui = ui; this.onSwitch = onSwitch; this.onExit = onExit; this.onRebind = onRebind; this.getAppearance = getAppearance; this.isFocused = isFocused;
     this.onChildInput = onChildInput; this.isPrefixHeld = isPrefixHeld; this.getPrefixHeldAt = getPrefixHeldAt; this.shouldHoldChildInput = shouldHoldChildInput;
+    const upgradingPasteMode = !this.hostPasteMode;
+    this.hostPasteMode ||= { enabled: true, partial: "" };
+    for (const child of this.children.values()) this.trackChildPasteMode(child);
+    if (this.outputWrapper && !this.outputWrapper.tracksPasteMode) this.installOutput();
+    if (upgradingPasteMode && !this.active) this.write(this.pasteModeSequence());
     if (!this.screenTransition) {
       this.screenTransition = new ScreenTransition(this); this.installOutput();
       const oldResize = this.onResize;
@@ -84,12 +91,35 @@ export class TerminalMux {
     const mux = this;
     this.outputWrapper = function (chunk, encoding, callback) {
       const data = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString(typeof encoding === "string" ? encoding : "utf8");
+      mux.trackPasteMode(mux.hostPasteMode, data);
       if (!mux.screenTransition?.hostOutput(data) && !mux.active) return mux.output.apply(this, arguments);
       const done = typeof encoding === "function" ? encoding : callback;
       if (done) process.nextTick(done);
       return true;
     };
+    this.outputWrapper.tracksPasteMode = true;
     process.stdout.write = this.outputWrapper;
+  }
+  trackPasteMode(state, data) {
+    if (!state.partial && !data.includes("\x1b")) return;
+    const input = state.partial + data;
+    for (const match of input.matchAll(/\x1b\[\?([0-9;]*)([hl])/g)) {
+      if (match[1].split(";").includes("2004")) state.enabled = match[2] === "h";
+    }
+    // A PTY read can end partway through a mode sequence.
+    const partial = /\x1b(?:\[(?:\?[0-9;]*)?)?$/.exec(input)?.[0] || "";
+    state.partial = partial.length <= 256 ? partial : "";
+  }
+  trackChildPasteMode(child) {
+    if (child.pasteMode) return;
+    // Existing connected Pi screens predate this tracker after a hot reload.
+    child.pasteMode = { enabled: !!child.socket && child.screenReady !== false, partial: "" };
+    if (typeof child.screenStartup === "string") this.trackPasteMode(child.pasteMode, child.screenStartup);
+    child.pasteModeListener = child.pty.onData(data => this.trackPasteMode(child.pasteMode, data));
+  }
+  pasteModeSequence(child) {
+    const mode = child ? child.pasteMode : this.hostPasteMode;
+    return mode?.enabled ? "\x1b[?2004h" : "\x1b[?2004l";
   }
   write(data) { this.output.call(process.stdout, data); }
   accept(socket) {
@@ -174,6 +204,7 @@ export class TerminalMux {
     const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
     ready.catch(() => {});
     const child = { session, token, pty, ready, resolveReady, rejectReady, socket: undefined, startup: "", screenStartup: "", negotiated: false, pendingInput: [], dynamicExit: true };
+    this.trackChildPasteMode(child);
     this.children.set(session, child);
     pty.onData(data => {
       if (typeof child.screenStartup === "string") {
@@ -208,6 +239,7 @@ export class TerminalMux {
   handleExit(child, event) {
     const currentSession = child.session;
     if (this.children.get(currentSession) !== child) return;
+    child.pasteModeListener?.dispose();
     this.children.delete(currentSession); child.socket?.destroy();
     child.rejectReady(new Error(`Pi thread exited (${event.signal || event.exitCode})`));
     const wasActive = this.active === child;
@@ -309,7 +341,7 @@ export class TerminalMux {
   dispose() {
     this.screenTransition?.cancel();
     this.active = undefined;
-    for (const child of this.children.values()) { try { child.pty.kill(); } catch {} child.socket?.destroy(); }
+    for (const child of this.children.values()) { child.pasteModeListener?.dispose(); try { child.pty.kill(); } catch {} child.socket?.destroy(); }
     this.children.clear();
     this.detachInput();
     if (process.stdout.write === this.outputWrapper) process.stdout.write = this.output;

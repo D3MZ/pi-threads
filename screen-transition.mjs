@@ -64,7 +64,7 @@ export class ScreenTransition {
         child.screenStartup = undefined;
         // The forced frame already clears the screen inside its synchronized
         // update. Startup output may instead be a pre-session prompt.
-        this.mux.write(`${beginSync}${this.modes()}${fullFrame ? "" : "\x1b[2J\x1b[H"}${data}${fullFrame ? "" : endSync}`);
+        this.mux.write(`${beginSync}${this.modes()}${this.mux.pasteModeSequence(child)}${fullFrame ? "" : "\x1b[2J\x1b[H"}${data}${fullFrame ? "" : endSync}`);
         if (!fullFrame && child.socket) this.mux.activate(child);
         resolve(true);
       };
@@ -123,7 +123,7 @@ export class ScreenTransition {
       if (this.pending !== pending) return;
       this.pending = undefined;
       this.mux.active = undefined;
-      this.mux.write(`${this.modes()}\x1b[2J\x1b[H`);
+      this.mux.write(`${this.modes()}${this.mux.pasteModeSequence()}\x1b[2J\x1b[H`);
       this.mux.ui.requestRender(true);
     }, 1500);
     this.mux.ui.requestRender(true);
@@ -136,7 +136,7 @@ export class ScreenTransition {
       this.pending = undefined;
       clearTimeout(pending.fallbackTimer);
       this.mux.active = undefined;
-      this.mux.write(`${beginSync}${this.modes()}\x1b[2J\x1b[H${frame}`);
+      this.mux.write(`${beginSync}${this.modes()}${this.mux.pasteModeSequence()}\x1b[2J\x1b[H${frame}`);
     }
     return true;
   }
