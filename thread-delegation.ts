@@ -65,7 +65,7 @@ function resolvePointer(sessionFile: string | undefined, branch: any[], args: { 
 function assignment(pointer: Pointer, content: any) {
   const text = messageText(content);
   const request = pointer.start === undefined ? text : Array.from(text).slice(pointer.start, pointer.end).join("");
-  return `Execute this part of the user request ${request}\n` +
+  return `Execute this part of the user request yourself: ${request}.\n` +
     `See session log: ${pointer.sessionFile} for more context.\n` +
     "If your work is being overwritten by another agent, then see their logs and confirm if it’s a newer instruction to do so.\n" +
     "If it’s a newer instruction that supersedes your own work, then close your thread.\n" +
