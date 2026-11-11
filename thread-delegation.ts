@@ -62,15 +62,17 @@ function resolvePointer(sessionFile: string | undefined, branch: any[], args: { 
   return pointer;
 }
 
-function assignment(pointer: Pointer) {
-  return `Execute the user request identified by this Pi session pointer:\n${JSON.stringify(pointer)}\n\n` +
-    "Read the referenced JSONL session log yourself; the request is not reproduced here. " +
-    "Entry IDs are top-level id fields. Follow parentId from contextLeafId to reconstruct the active branch as it existed at delegation, including later reviews already on that branch. " +
-    "Do not treat abandoned branches or later appended messages as assignments. Honor context_edit entries. " +
-    "If start/end are present, only that zero-based, end-exclusive Unicode-code-point range of the selected message text (text blocks joined with a newline) is assigned; surrounding text is context. " +
-    "Images attached here are copied from the source message; read other relevant image blocks on the captured branch. Do not repeatedly delegate the same assignment unchanged. " +
-    "If blocked or the request is ambiguous, explain that rather than guessing. Do not modify the parent log. " +
-    "End with a concise final response stating what was completed and verified, or the blocker; do not claim success without verification.";
+function assignment(pointer: Pointer, content: any) {
+  const text = messageText(content);
+  const request = pointer.start === undefined ? text : Array.from(text).slice(pointer.start, pointer.end).join("");
+  return `Execute this part of the user request ${request}\n` +
+    `See session log: ${pointer.sessionFile} for more context.\n` +
+    "If your work is being overwritten by another agent, then see their logs and confirm if it’s a newer instruction to do so.\n" +
+    "If it’s a newer instruction that supersedes your own work, then close your thread.\n" +
+    "If it’s a parallel instruction that prevents you both from working concurrently, then increase your scope to:\n" +
+    "1. Reengineer the code such that the two tasks were able to be done concurrently without these kind of interruptions.\n" +
+    "2. Do both of the tasks in another work tree\n" +
+    "3. Merge in.";
 }
 
 function completionText(result: Result, include: boolean) {
@@ -243,7 +245,7 @@ export function registerThreadDelegation<G extends DelegationGroup>(pi: Extensio
       const selected = branch.find(entry => entry.id === pointer.messageId);
       const content = selected?.type === "message" && selected.message.role === "user" ? selected.message.content : undefined;
       const images = Array.isArray(content) ? content.filter(block => block.type === "image").map(block => ({ type: "image" as const, data: block.data, mimeType: block.mimeType })) : [];
-      const text = assignment(pointer);
+      const text = assignment(pointer, content);
       const message = images.length ? [{ type: "text" as const, text }, ...images] : text;
       const path = await helpers.ensureGroup(ctx);
       if (shuttingDown || signal?.aborted || ctx.sessionManager.getSessionFile() !== origin) throw new Error("Delegation cancelled before launch.");
