@@ -1,5 +1,5 @@
 import { DynamicBorder, getAgentDir, getSettingsListTheme, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Container, SettingsList } from "@earendil-works/pi-tui";
+import { Container, Input, SettingsList, Text } from "@earendil-works/pi-tui";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -15,13 +15,22 @@ export function autoThreadingEnabled() {
   }
 }
 
-function saveAutoThreading(enabled: boolean) {
+export function autoThreadingTime() {
+  try {
+    const time = JSON.parse(readFileSync(settingsPath, "utf8")).time;
+    return typeof time === "string" ? time : "5 minutes";
+  } catch {
+    return "5 minutes";
+  }
+}
+
+function saveThreadSetting(key: "autoThreading" | "time", value: boolean | string) {
   let settings: Record<string, unknown> = {};
   try {
     const saved = JSON.parse(readFileSync(settingsPath, "utf8"));
     if (saved && typeof saved === "object" && !Array.isArray(saved)) settings = saved;
   } catch { /* Start with the defaults. */ }
-  settings.autoThreading = enabled;
+  settings[key] = value;
   mkdirSync(settingsDir, { recursive: true, mode: 0o700 });
   const temporary = `${settingsPath}.${process.pid}.${randomUUID()}.tmp`;
   try {
@@ -37,7 +46,7 @@ export async function showThreadSettings(ctx: ExtensionContext) {
     ctx.ui.notify("Thread settings require interactive mode", "error");
     return;
   }
-  await ctx.ui.custom<void>((tui, _theme, _keys, done) => {
+  await ctx.ui.custom<void>((tui, theme, _keys, done) => {
     const container = new Container();
     container.addChild(new DynamicBorder());
     const list = new SettingsList([{
@@ -46,10 +55,34 @@ export async function showThreadSettings(ctx: ExtensionContext) {
       description: "Allow agents to delegate work to numbered threads",
       currentValue: String(autoThreadingEnabled()),
       values: ["true", "false"],
-    }], 10, getSettingsListTheme(), (_id, value) => {
-      try { saveAutoThreading(value === "true"); }
-      catch (error) {
-        list.updateValue("auto-threading", String(autoThreadingEnabled()));
+    }, {
+      id: "time",
+      label: "Time threshold",
+      description: "The time threshold before the agent will start delegating tasks to other threads",
+      currentValue: autoThreadingTime(),
+      submenu: (value, close) => {
+        const input = new Input();
+        input.setValue(value);
+        input.focused = true;
+        input.onSubmit = close;
+        input.onEscape = () => close();
+        const content = new Container();
+        content.addChild(new Text(theme.fg("accent", "  Time threshold"), 0, 0));
+        content.addChild(input);
+        content.addChild(new Text(theme.fg("dim", "  Enter to save · Esc to cancel"), 0, 0));
+        return {
+          render: (width: number) => content.render(width),
+          invalidate: () => content.invalidate(),
+          handleInput: (data: string) => input.handleInput(data),
+          handleMouse: (event: Parameters<Container["handleMouse"]>[0]) => content.handleMouse(event),
+        };
+      },
+    }], 10, getSettingsListTheme(), (id, value) => {
+      try {
+        if (id === "auto-threading") saveThreadSetting("autoThreading", value === "true");
+        else if (id === "time") saveThreadSetting("time", value);
+      } catch (error) {
+        list.updateValue(id, id === "auto-threading" ? String(autoThreadingEnabled()) : autoThreadingTime());
         ctx.ui.notify(`Could not save thread settings: ${String(error)}`, "error");
       }
     }, () => done(), { enableSearch: true });

@@ -3,7 +3,7 @@ import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, unlinkSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
-import { autoThreadingEnabled } from "./thread-settings.ts";
+import { autoThreadingEnabled, autoThreadingTime } from "./thread-settings.ts";
 
 type Pointer = { sessionFile: string; messageId: string; contextLeafId?: string; start?: number; end?: number };
 type Result = { id: string; slot: string; session: string; success: boolean; status: string; lastResponse: string; error?: string };
@@ -204,13 +204,16 @@ export function registerThreadDelegation<G extends DelegationGroup>(pi: Extensio
       && /(?:^|[/\\])pi-delegate(?:[/\\]|$)/.test(tool.sourceInfo.path)).map(tool => tool.name));
     if (legacy.size) pi.setActiveTools(pi.getActiveTools().filter(name => !legacy.has(name)));
     const enabled = ctx.mode === "tui" && autoThreadingEnabled();
+    const methods = pi.getAllTools().filter(tool => ["pi_threads_delegate", "pi_threads_delegate_callback"].includes(tool.name))
+      .map(tool => {
+        const schema = tool.parameters as { properties?: Record<string, object>; required?: string[] };
+        const params = Object.keys(schema.properties ?? {}).map(name => `${name}${schema.required?.includes(name) ? "" : "?"}`);
+        return `${tool.name}(${params.join(", ")})`;
+      }).join(", ");
     event.systemPromptOptions.sections.pi_threads_auto = enabled
-      ? "Auto-threading is ON. For suitable independent execution work, you may call pi_threads_delegate using a pointer to the user's request; keep discussion here and avoid overlapping edits. " +
-        "Omit messageId for the latest user message, or read the session log for an earlier top-level user-entry ID; optional start/end identify a Unicode range. " +
-        `Session log: ${JSON.stringify(ctx.sessionManager.getSessionFile() ?? null)}. ` +
-        "A delegated thread must not delegate its initial assignment unchanged, but may delegate distinct work and new user requests. " +
-        "Results arrive without polling. Set notifyOnCompletion and returnLastResponse when an authorized next step needs them; pi_threads_delegate_callback can subscribe later. " +
-        "If thread slots are full, do the work yourself. Do not delegate completion notifications as new assignments."
+      ? `Call pi_threads_delegate() if the user message requires more than ${autoThreadingTime()} of work.\n` +
+        `These are the tool methods when relevant: ${methods}.\n` +
+        "The tool communicates with the user when you’re delegating or when messages are returned, do not echo these"
       : "Auto-threading is OFF or unavailable. Work directly; do not launch pi_threads_delegate.";
   });
 
