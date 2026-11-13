@@ -6,7 +6,7 @@ type Dialog = { id: string; method: string; title?: string; message?: string; op
 
 // A Pi overlay, not a second terminal or a terminal window. The RPC agent keeps
 // running when this component is closed or another thread is selected.
-export function openThreadView(ctx: ExtensionContext, client: ThreadClient, title: string, legend: () => string, back: () => void, switchTo: (slot: string) => void) {
+export function openThreadView(ctx: ExtensionContext, client: ThreadClient, title: string, legend: () => string, back: () => void) {
   let closeComponent: (() => void) | undefined;
   let rerender: (() => void) | undefined;
   let preview = false;
@@ -32,8 +32,6 @@ export function openThreadView(ctx: ExtensionContext, client: ThreadClient, titl
     editor.onChange = text => { (client as any).draft = text; };
     editor.onSubmit = text => {
       if (!text.trim()) return;
-      const switchCommand = /^\/(?:threads|chatthread)\s+([0-9])\s*$/i.exec(text);
-      if (switchCommand) { switchTo(switchCommand[1]); return; }
       if (client.state !== "ready") { editor.setText(text); return; }
       void client.prompt(text).then(() => tui.requestRender(), error => {
         if (!editor.getText()) editor.setText(text);
@@ -108,7 +106,7 @@ export function openThreadView(ctx: ExtensionContext, client: ThreadClient, titl
           ? [theme.fg("warning", `${currentDialog.title || "Thread request"}${currentDialog.message ? `: ${currentDialog.message}` : ""}`), ...(select?.render(w) || dialogEditor?.render(w) || [])]
           : editor.render(w);
         const header = truncateToWidth(theme.fg("accent", `↳ ${title} ${client.busy ? "· working" : client.state === "closed" ? `· stopped: ${client.error?.message || "process exited"}` : ""}${client.notice ? ` · ${client.notice.text}` : ""}`), w);
-        const hint = truncateToWidth(theme.fg("dim", "Esc: main · /threads N: switch · PgUp/PgDn: scroll · Ctrl+C: abort"), w);
+        const hint = truncateToWidth(theme.fg("dim", "Esc: main · PgUp/PgDn: scroll · Ctrl+C: abort"), w);
         const available = Math.max(0, rows - bottom.length - (preview ? 3 : 2));
         const end = Math.max(0, lines.length - scroll);
         const visible = lines.slice(Math.max(0, end - available), end);

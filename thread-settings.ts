@@ -7,6 +7,14 @@ import { join } from "node:path";
 const settingsDir = join(getAgentDir(), "pi-threads");
 const settingsPath = join(settingsDir, "settings.json");
 
+export function threadsEnabled() {
+  try {
+    return JSON.parse(readFileSync(settingsPath, "utf8")).enabled !== false;
+  } catch {
+    return true;
+  }
+}
+
 export function autoThreadingEnabled() {
   try {
     return JSON.parse(readFileSync(settingsPath, "utf8")).autoThreading === true;
@@ -24,7 +32,7 @@ export function autoThreadingTime() {
   }
 }
 
-function saveThreadSetting(key: "autoThreading" | "time", value: boolean | string) {
+function saveThreadSetting(key: "enabled" | "autoThreading" | "time", value: boolean | string) {
   let settings: Record<string, unknown> = {};
   try {
     const saved = JSON.parse(readFileSync(settingsPath, "utf8"));
@@ -41,15 +49,26 @@ function saveThreadSetting(key: "autoThreading" | "time", value: boolean | strin
   }
 }
 
-export async function showThreadSettings(ctx: ExtensionContext) {
+export async function showThreadSettings(ctx: ExtensionContext, actions: {
+  enabledChanged(): void;
+  keybindings(): Promise<void>;
+  threads(): Promise<void>;
+}) {
   if (ctx.mode !== "tui") {
     ctx.ui.notify("Thread settings require interactive mode", "error");
     return;
   }
-  await ctx.ui.custom<void>((tui, theme, _keys, done) => {
+  const open = () => ctx.ui.custom<"keybindings" | "threads" | undefined>((tui, theme, _keys, done) => {
     const container = new Container();
     container.addChild(new DynamicBorder());
+    container.addChild(new Text(theme.fg("accent", "  Thread settings"), 0, 0));
     const list = new SettingsList([{
+      id: "enabled",
+      label: "Enabled",
+      description: "Enable thread shortcuts and automatic delegation; existing threads keep running",
+      currentValue: String(threadsEnabled()),
+      values: ["true", "false"],
+    }, {
       id: "auto-threading",
       label: "Auto-threading",
       description: "Allow agents to delegate work to numbered threads",
@@ -77,15 +96,30 @@ export async function showThreadSettings(ctx: ExtensionContext) {
           handleMouse: (event: Parameters<Container["handleMouse"]>[0]) => content.handleMouse(event),
         };
       },
+    }, {
+      id: "keybindings",
+      label: "Keybindings",
+      description: "Configure thread shortcuts",
+      currentValue: "Configure",
+      values: ["Configure"],
+    }, {
+      id: "threads",
+      label: "Threads",
+      description: "Choose an existing thread",
+      currentValue: "Show",
+      values: ["Show"],
     }], 10, getSettingsListTheme(), (id, value) => {
+      if (id === "keybindings" || id === "threads") { done(id); return; }
       try {
-        if (id === "auto-threading") saveThreadSetting("autoThreading", value === "true");
+        if (id === "enabled") { saveThreadSetting("enabled", value === "true"); actions.enabledChanged(); }
+        else if (id === "auto-threading") saveThreadSetting("autoThreading", value === "true");
         else if (id === "time") saveThreadSetting("time", value);
       } catch (error) {
-        list.updateValue(id, id === "auto-threading" ? String(autoThreadingEnabled()) : autoThreadingTime());
+        const current = id === "enabled" ? String(threadsEnabled()) : id === "auto-threading" ? String(autoThreadingEnabled()) : autoThreadingTime();
+        list.updateValue(id, current);
         ctx.ui.notify(`Could not save thread settings: ${String(error)}`, "error");
       }
-    }, () => done(), { enableSearch: true });
+    }, () => done(undefined), { enableSearch: true });
     container.addChild(list);
     container.addChild(new DynamicBorder());
     return {
@@ -93,7 +127,13 @@ export async function showThreadSettings(ctx: ExtensionContext) {
       render: (width: number) => container.render(width),
       invalidate: () => container.invalidate(),
       handleInput(data: string) { list.handleInput(data); tui.requestRender(); },
-      handleMouse(event: Parameters<SettingsList["handleMouse"]>[0]) { return list.handleMouse(event); },
+      handleMouse(event: Parameters<Container["handleMouse"]>[0]) { return container.handleMouse(event); },
     };
   });
+  for (;;) {
+    const action = await open();
+    if (!action) return;
+    if (action === "threads") { await actions.threads(); return; }
+    await actions.keybindings();
+  }
 }

@@ -8,7 +8,7 @@ import { isCloseShortcut, parseKeyboardEvent } from "./keyboard.ts";
 import { heartbeatBrightness, renderThreadIndicators, type ThreadIndicator } from "./thread-activity.ts";
 import { registerThreadWake, rememberThreadWakeups, type ThreadWakeup } from "./thread-wake.ts";
 import { finishDelegatedThread, registerThreadDelegation, type ThreadDelegation } from "./thread-delegation.ts";
-import { showThreadSettings } from "./thread-settings.ts";
+import { showThreadSettings, threadsEnabled } from "./thread-settings.ts";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -261,6 +261,7 @@ export default async function (pi: ExtensionAPI) {
   const childSocket = process.env.PI_THREADS_SOCKET || process.env.PI_CHATTHREADS_SOCKET;
   const childToken = process.env.PI_THREADS_SOCKET ? process.env.PI_THREADS_TOKEN : process.env.PI_CHATTHREADS_TOKEN;
   let pending: PendingTarget | undefined;
+  let enabled = threadsEnabled();
   let creating = false;
   let closing: string | undefined;
   let recovering = false;
@@ -302,6 +303,18 @@ export default async function (pi: ExtensionAPI) {
     prefixHeld = held;
     inheritedPrefixHeld = held;
     setSelectorHeld(held);
+  }
+  function syncEnabled() {
+    const next = threadsEnabled();
+    if (enabled === next) return enabled;
+    enabled = next;
+    if (!enabled) {
+      swarmKey = undefined;
+      setPrefixHeld(false);
+      pending = undefined;
+      hideTargets();
+    }
+    return enabled;
   }
   function isThreadSwitchInput(raw: string) {
     const key = parseKeyboardEvent(raw);
@@ -531,7 +544,7 @@ export default async function (pi: ExtensionAPI) {
     const onChildInput = (data: string) => {
       const key = parseKeyboardEvent(data);
       if (swarmKey && key && ((key.modifierKey && (key.modifiers & 4) === 0) || (key.code === 115 && key.event === 3))) swarmKey = undefined;
-      if (!terminalFocused || !key?.modifierKey) return false;
+      if (!syncEnabled() || !terminalFocused || !key?.modifierKey) return false;
       const held = (key.modifiers & prefixMask) === prefixMask;
       const changed = prefixHeld !== held;
       setPrefixHeld(held);
@@ -1023,10 +1036,6 @@ export default async function (pi: ExtensionAPI) {
     if (targetMode) hideTargets();
     else if (!replyBlocksSelection(ctx)) await showTargets(ctx);
   }
-  async function enableTargets(ctx: ExtensionContext) {
-    if (targetMode || replyBlocksSelection(ctx)) return;
-    await showTargets(ctx);
-  }
   async function choose(ctx: ExtensionContext, slot: string) {
     if (!targetMode) return focusSlot(ctx, slot);
     const group = groupFile && readGroup(groupFile);
@@ -1184,6 +1193,7 @@ export default async function (pi: ExtensionAPI) {
     }
   }
   async function settings(ctx: ExtensionContext) {
+    const savedConfig = loadConfig();
     const choices = ["Open thread tree shortcut", "Thread modifier prefix", "Previous thread shortcut", "Next thread shortcut", "New thread shortcut", "Thread 1 shortcut", "Restore defaults"];
     const picked = await ctx.ui.select("Thread keybindings", choices);
     if (!picked) return;
@@ -1191,13 +1201,13 @@ export default async function (pi: ExtensionAPI) {
     if (picked === choices[6]) nextConfig = { ...defaults };
     else {
       const key = (["targets", "prefix", "previous", "next", "newThread", "mainThread"] as const)[choices.indexOf(picked)];
-      const value = await ctx.ui.input(`${picked} (current: ${config[key]})`, config[key]);
+      const value = await ctx.ui.input(`${picked} (current: ${savedConfig[key]})`, savedConfig[key]);
       if (value === undefined) return;
       const v = value.trim().toLowerCase();
       if (key === "prefix" ? !/^(?:(?:ctrl|alt|shift|super)\+)*(?:ctrl|alt|shift|super)$/.test(v) : !/^(?:(?:ctrl|alt|shift|super)\+)+(?:[a-z0-9;]|left|right|up|down|f(?:[1-9]|1[0-2]))$/.test(v)) {
         ctx.ui.notify("Invalid shortcut", "error"); return;
       }
-      nextConfig = { ...config, [key]: v };
+      nextConfig = { ...savedConfig, [key]: v };
     }
     if (!uniqueShortcuts(nextConfig)) { ctx.ui.notify("Those thread shortcuts overlap; choose distinct keys", "error"); return; }
     ensureDir();
@@ -1300,7 +1310,10 @@ export default async function (pi: ExtensionAPI) {
     }
     const enableKeyboard = () => {
       if (!ui?.terminal?.kittyProtocolActive) { keyboardEnabled = false; return; }
-      if (!keyboardEnabled) { ui.terminal.write("\x1b[=24;2u"); keyboardEnabled = true; }
+      if (!syncEnabled()) {
+        if (keyboardEnabled) ui.terminal.write("\x1b[=24;3u");
+        keyboardEnabled = false;
+      } else if (!keyboardEnabled) { ui.terminal.write("\x1b[=24;2u"); keyboardEnabled = true; }
     };
     const tick = () => { enableKeyboard(); refreshFooterSlots(); };
     tick();
@@ -1317,6 +1330,7 @@ export default async function (pi: ExtensionAPI) {
       if (raw === "\x1b[I" || raw === "\x1b[O") return { consume: true };
       const key = parseKeyboardEvent(raw);
       const data = key?.normalized || raw;
+      if (!syncEnabled()) return key && (key.text !== undefined || data !== raw) ? { data: key.text ?? data } : undefined;
       if (key?.modifierKey) {
         // Ghostty can send modifier-only events to background tabs.
         if (!terminalFocused) return { consume: true };
@@ -1386,6 +1400,10 @@ export default async function (pi: ExtensionAPI) {
           if (ctx.ui.getEditorText() === text) ctx.ui.setEditorText("");
           pending = undefined; refreshMode();
         }, e => ctx.ui.notify(`Could not open thread: ${errorText(e)}`, "error")).finally(() => { creating = false; });
+        return { consume: true };
+      }
+      if (matchesKey(data, config.targets as any) && editorFocused()) {
+        if (!key || key.event === 1) void toggleTargets(ctx);
         return { consume: true };
       }
       // Some terminals report the held modifier separately but send a bare digit.
@@ -1460,7 +1478,7 @@ export default async function (pi: ExtensionAPI) {
           if (typeof focused === "boolean") setTerminalFocus(focused);
           swarmKey = undefined;
           prefixHeld = false;
-          inheritedPrefixHeld = held === true && terminalFocused;
+          inheritedPrefixHeld = syncEnabled() && held === true && terminalFocused;
           setSelectorHeld(inheritedPrefixHeld, heldAt);
           hideTargets();
           // A background PTY cannot receive terminal palette replies. Re-query
@@ -1468,7 +1486,7 @@ export default async function (pi: ExtensionAPI) {
           ui?.handleTerminalInput?.(`\x1b[?997;${appearance === "light" ? "2" : "1"}n`);
           ui?.requestRender(true);
         }, onModifier: (held: boolean, heldAt?: number) => {
-          inheritedPrefixHeld = held === true && terminalFocused;
+          inheritedPrefixHeld = syncEnabled() && held === true && terminalFocused;
           setSelectorHeld(inheritedPrefixHeld, heldAt);
         } });
       if (waitForPaint) {
@@ -1563,41 +1581,15 @@ export default async function (pi: ExtensionAPI) {
     return { action: "handled" };
   });
   pi.registerCommand("threads", {
-    description: "Choose thread targets, switch threads, or configure shortcuts",
-    getArgumentCompletions: (prefix) => {
-      const group = groupFile && readGroup(groupFile);
-      const options = [
-        { value: "on", label: "on", description: "Open the thread target tree" },
-        { value: "off", label: "off", description: "Cancel a pending thread reply" },
-        { value: "show", label: "show", description: "Choose an existing thread" },
-        { value: "settings", label: "settings", description: "Configure thread settings" },
-        { value: "keybinding", label: "keybinding", description: "Configure shortcuts" },
-        ...visibleThreads(group).map(t => ({ value: t.slot, label: t.slot, description: `Switch to ${t.title}` })),
-      ];
-      const matches = options.filter(option => option.value.startsWith(prefix));
-      // Once a complete command is typed, Enter should run it instead of accepting it again.
-      if (matches.some(option => option.value === prefix)) return null;
-      return matches.length ? matches : null;
-    },
-    handler: async (args, ctx) => {
-      if (ctx.mode !== "tui") return;
-      const command = args.trim();
-      if (command === "keybinding") await settings(ctx);
-      else if (command === "settings") await showThreadSettings(ctx);
-      else if (command === "show") await listThreads(ctx);
-      else if (command === "on") await enableTargets(ctx);
-      else if (command === "off") {
-        if (creating) ctx.ui.notify("The new thread is starting", "warning");
-        else { pending = undefined; hideTargets(); }
-      } else if (/^[0-9]$/.test(command)) await switchOrCreate(ctx, command);
-      else ctx.ui.notify(`Open tree: short tap ${config.prefix}, ${config.targets}, or /threads on. Switch or create: ${config.prefix}+number or /threads <number>. Swarm: hold ctrl+s+number (Kitty keyboard). Also: /threads off, show, settings, keybinding.`, command ? "warning" : "info");
+    description: "Manage thread settings",
+    handler: async (_args, ctx) => {
+      await showThreadSettings(ctx, {
+        enabledChanged: () => { syncEnabled(); },
+        keybindings: () => settings(ctx),
+        threads: () => listThreads(ctx),
+      });
     },
   });
-  pi.registerShortcut(config.targets as any, { description: "Open the thread target tree", handler: toggleTargets });
-  for (const slot of slots) pi.registerShortcut(`${config.prefix}+${slot}` as any, { description: `Switch to or create thread ${slot}`, handler: ctx => switchOrCreate(ctx, slot) });
-  pi.registerShortcut(config.previous as any, { description: "Previous chat thread", handler: ctx => cycle(ctx, -1) });
-  pi.registerShortcut(config.next as any, { description: "Next chat thread", handler: ctx => cycle(ctx, 1) });
-  pi.registerShortcut(config.mainThread as any, { description: "Switch to or create thread 1", handler: ctx => switchOrCreate(ctx, "1") });
   registerThreadWake(pi, {
     groupPath: () => groupFile,
     ensureGroup: async ctx => {

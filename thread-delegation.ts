@@ -3,7 +3,7 @@ import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, unlinkSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
-import { autoThreadingEnabled, autoThreadingTime } from "./thread-settings.ts";
+import { autoThreadingEnabled, autoThreadingTime, threadsEnabled } from "./thread-settings.ts";
 
 type Pointer = { sessionFile: string; messageId: string; contextLeafId?: string; start?: number; end?: number };
 type Result = { id: string; slot: string; session: string; success: boolean; status: string; lastResponse: string; error?: string };
@@ -205,7 +205,7 @@ export function registerThreadDelegation<G extends DelegationGroup>(pi: Extensio
     const legacy = new Set(pi.getAllTools().filter(tool => ["delegate", "delegate_callback"].includes(tool.name)
       && /(?:^|[/\\])pi-delegate(?:[/\\]|$)/.test(tool.sourceInfo.path)).map(tool => tool.name));
     if (legacy.size) pi.setActiveTools(pi.getActiveTools().filter(name => !legacy.has(name)));
-    const enabled = ctx.mode === "tui" && autoThreadingEnabled();
+    const enabled = ctx.mode === "tui" && threadsEnabled() && autoThreadingEnabled();
     const methods = pi.getAllTools().filter(tool => ["pi_threads_delegate", "pi_threads_delegate_callback"].includes(tool.name))
       .map(tool => {
         const schema = tool.parameters as { properties?: Record<string, object>; required?: string[] };
@@ -237,7 +237,7 @@ export function registerThreadDelegation<G extends DelegationGroup>(pi: Extensio
       returnLastResponse: Type.Optional(Type.Boolean({ description: "Include the last assistant response in the completion. Default false." })),
     }, { additionalProperties: false }),
     async execute(_id, args, signal, _update, ctx) {
-      if (ctx.mode !== "tui" || !autoThreadingEnabled()) throw new Error("Auto-threading is off or unavailable.");
+      if (ctx.mode !== "tui" || !threadsEnabled() || !autoThreadingEnabled()) throw new Error("Auto-threading is off or unavailable.");
       if (shuttingDown || signal?.aborted) throw new Error("Delegation cancelled before launch.");
       const origin = ctx.sessionManager.getSessionFile();
       const branch = ctx.sessionManager.getBranch();
