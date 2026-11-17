@@ -14,6 +14,7 @@ export type ThreadDelegation = {
   session: string;
   slot: string;
   leafId?: string;
+  pointer?: Pointer;
   notifyOnCompletion?: boolean;
   returnLastResponse: boolean;
   state: "running" | "completed";
@@ -105,6 +106,16 @@ export function registerThreadDelegation<G extends DelegationGroup>(pi: Extensio
   let monitor: Monitor | undefined;
   const callbacks = new Map<string, Callback>();
   const starting = new Set<Promise<unknown>>();
+
+  function isDelegatedThread(ctx: ExtensionContext) {
+    const path = helpers.groupPath(), session = ctx.sessionManager.getSessionFile();
+    return !!(path && session && helpers.readGroup(path)?.threads.some(thread => thread.session === session && thread.delegation && !thread.closed));
+  }
+
+  function overlaps(a: Pointer, b: Pointer) {
+    return a.sessionFile === b.sessionFile && a.messageId === b.messageId &&
+      (a.start ?? 0) < (b.end ?? Infinity) && (b.start ?? 0) < (a.end ?? Infinity);
+  }
 
   function stopMonitor(state: Monitor) {
     state.stopped = true;
@@ -205,7 +216,8 @@ export function registerThreadDelegation<G extends DelegationGroup>(pi: Extensio
     const legacy = new Set(pi.getAllTools().filter(tool => ["delegate", "delegate_callback"].includes(tool.name)
       && /(?:^|[/\\])pi-delegate(?:[/\\]|$)/.test(tool.sourceInfo.path)).map(tool => tool.name));
     if (legacy.size) pi.setActiveTools(pi.getActiveTools().filter(name => !legacy.has(name)));
-    const enabled = ctx.mode === "tui" && threadsEnabled() && autoThreadingEnabled();
+    const delegated = isDelegatedThread(ctx);
+    const enabled = !delegated && ctx.mode === "tui" && threadsEnabled() && autoThreadingEnabled();
     const methods = pi.getAllTools().filter(tool => ["pi_threads_delegate", "pi_threads_delegate_callback"].includes(tool.name))
       .map(tool => {
         const schema = tool.parameters as { properties?: Record<string, object>; required?: string[] };
@@ -215,8 +227,23 @@ export function registerThreadDelegation<G extends DelegationGroup>(pi: Extensio
     event.systemPromptOptions.sections.pi_threads_auto = enabled
       ? `Call pi_threads_delegate() if the user message requires more than ${autoThreadingTime()} of work.\n` +
         `These are the tool methods when relevant: ${methods}.\n` +
-        "The tool communicates with the user when you’re delegating or when messages are returned, do not echo these"
+        "Call pi_threads_delegate directly and alone, as your final action. A successful handoff ends your turn; the worker's answer is displayed on completion. Do not also do the delegated work."
+      : delegated ? "You are a delegated worker. Do the assigned work yourself; do not delegate it again."
       : "Auto-threading is OFF or unavailable. Work directly; do not launch pi_threads_delegate.";
+  });
+
+  // Termination only applies when every result in a tool batch terminates.
+  // Reject mixed or nested calls before any worker can start.
+  pi.on("tool_call", (event, ctx) => {
+    if (event.toolName !== "pi_threads_delegate") return;
+    if (isDelegatedThread(ctx)) return { block: true, reason: "Delegated workers must do their assigned work directly." };
+    if (event.parentToolCallId) return { block: true, reason: "Call pi_threads_delegate directly, not through another tool." };
+    const entry = [...ctx.sessionManager.getBranch()].reverse().find(item => item.type === "message" && item.message.role === "assistant" &&
+      item.message.content.some(block => block.type === "toolCall" && block.id === event.toolCallId));
+    if (!entry || entry.type !== "message" || entry.message.role !== "assistant" ||
+      entry.message.content.filter(block => block.type === "toolCall").length !== 1) {
+      return { block: true, reason: "Call pi_threads_delegate alone in a separate assistant response; no worker was started." };
+    }
   });
 
   pi.on("session_start", (_event, ctx) => {
@@ -228,16 +255,17 @@ export function registerThreadDelegation<G extends DelegationGroup>(pi: Extensio
   pi.registerTool({
     name: "pi_threads_delegate",
     label: "Delegate to Thread",
-    description: "Start a numbered background thread from a pointer to a user message in this session. Returns immediately; the completion is displayed automatically. No task text, polling, or general agent-to-agent chat. Workers share the cwd; assign non-overlapping work. Use pi_threads_delegate_callback for an authorized follow-up.",
+    description: "Hand a user request to a numbered background thread. Call this tool directly and alone: a successful handoff ends your turn, and the worker's response is displayed on completion. Workers share the cwd. No task text, polling, or general agent-to-agent chat.",
     parameters: Type.Object({
       messageId: Type.Optional(Type.String({ description: "Earlier top-level user-message entry ID; defaults to the latest user message." })),
       start: Type.Optional(Type.Integer({ minimum: 0, description: "Zero-based Unicode code point offset; requires end." })),
       end: Type.Optional(Type.Integer({ minimum: 1, description: "Exclusive Unicode code point offset; requires start." })),
       notifyOnCompletion: Type.Optional(Type.Boolean({ description: "Wake for authorized follow-up. By default only errors wake the parent." })),
-      returnLastResponse: Type.Optional(Type.Boolean({ description: "Include the last assistant response in the completion. Default false." })),
+      returnLastResponse: Type.Optional(Type.Boolean({ description: "Include the last assistant response in the completion. Default true." })),
     }, { additionalProperties: false }),
     async execute(_id, args, signal, _update, ctx) {
       if (ctx.mode !== "tui" || !threadsEnabled() || !autoThreadingEnabled()) throw new Error("Auto-threading is off or unavailable.");
+      if (isDelegatedThread(ctx)) throw new Error("Delegated workers must do their assigned work directly.");
       if (shuttingDown || signal?.aborted) throw new Error("Delegation cancelled before launch.");
       const origin = ctx.sessionManager.getSessionFile();
       const branch = ctx.sessionManager.getBranch();
@@ -256,6 +284,15 @@ export function registerThreadDelegation<G extends DelegationGroup>(pi: Extensio
           if (!group) throw new Error("Thread group is unavailable.");
           const parent = group.threads.find(thread => thread.session === origin && !thread.closed);
           if (!parent || parent.pid !== process.pid) throw new Error("The requesting thread is no longer active.");
+          const duplicate = (group.delegations || []).find(task => {
+            if (task.parent !== origin || task.state !== "running") return false;
+            // Older running delegations only recorded their pointer in the tool result.
+            const saved = branch.find(entry => entry.type === "message" && entry.message.role === "toolResult" &&
+              entry.message.toolName === "pi_threads_delegate" && (entry.message.details as any)?.id === task.id) as any;
+            const other: Pointer | undefined = task.pointer || saved?.message?.details?.pointer;
+            return !!other && overlaps(pointer, other);
+          });
+          if (duplicate) throw new Error(`That part of the request is already running in thread ${duplicate.slot}.`);
           slot = [...slots].find(value => !group.threads.some(thread => !thread.closed && thread.slot === value)) || "";
           if (!slot) throw new Error("Error: thread slots currently full, do it yourself.");
           const fresh = SessionManager.create(ctx.cwd, ctx.sessionManager.getSessionDir(), { id, parentSession: origin });
@@ -269,13 +306,13 @@ export function registerThreadDelegation<G extends DelegationGroup>(pi: Extensio
           const model = ctx.model;
           group.threads.push({ slot, session: child, title: "Delegated task", kickoff, delegation: id,
             ...(model ? { initialModel: { provider: model.provider, id: model.id, thinking: pi.getThinkingLevel() } } : {}) });
-          (group.delegations ||= []).push({ id, parent: origin!, parentPid: process.pid, session: child, slot, leafId: pointer.contextLeafId,
-            notifyOnCompletion: args.notifyOnCompletion, returnLastResponse: args.returnLastResponse ?? false, state: "running" });
+          (group.delegations ||= []).push({ id, parent: origin!, parentPid: process.pid, session: child, slot, leafId: pointer.contextLeafId, pointer,
+            notifyOnCompletion: args.notifyOnCompletion, returnLastResponse: args.returnLastResponse ?? true, state: "running" });
           helpers.writeGroup(path, group);
           registered = true;
         });
         const callback: Callback = { origin: origin!, leafId: pointer.contextLeafId, notifyOnCompletion: args.notifyOnCompletion,
-          returnLastResponse: args.returnLastResponse ?? false, delivered: false };
+          returnLastResponse: args.returnLastResponse ?? true, delivered: false };
         callbacks.set(id, callback);
         startMonitor(path, origin!, ctx);
         const launch = helpers.start(ctx, id, child);
@@ -285,7 +322,7 @@ export function registerThreadDelegation<G extends DelegationGroup>(pi: Extensio
           await helpers.stop(ctx, id, child).catch(() => {});
           throw new Error("Delegation cancelled during launch.");
         }
-        return { content: [{ type: "text", text: `Started worker ${id} in thread ${slot}. Session log: ${child}. Continue; do not wait or poll.` }], details: { id, slot, session: child, pointer } };
+        return { content: [{ type: "text", text: `Started worker ${id} in thread ${slot}. Its completion will be displayed automatically. Session log: ${child}.` }], details: { id, slot, session: child, pointer }, terminate: true };
       } catch (error) {
         if (registered) {
           await helpers.locked(path, group => {
