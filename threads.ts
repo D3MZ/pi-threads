@@ -7,6 +7,7 @@ import { loadTerminalMux } from "./terminal-mux-loader.mjs";
 import { isCloseShortcut, parseKeyboardEvent } from "./keyboard.ts";
 import { heartbeatBrightness, renderThreadIndicators, type ThreadIndicator } from "./thread-activity.ts";
 import { registerThreadWake, rememberThreadWakeups, type ThreadWakeup } from "./thread-wake.ts";
+import { pruneThreadFollowUps, registerThreadFollowUp, type ThreadFollowUp } from "./thread-follow-up.ts";
 import { finishDelegatedThread, registerThreadDelegation, type ThreadDelegation } from "./thread-delegation.ts";
 import { showThreadSettings, threadsEnabled } from "./thread-settings.ts";
 import { basename, dirname, join, resolve } from "node:path";
@@ -24,8 +25,8 @@ const extensionPath = fileURLToPath(import.meta.url);
 const legacyExtensionPath = fileURLToPath(new URL("./chatthreads.ts", import.meta.url));
 const defaults = { targets: "ctrl+;", prefix: "ctrl", previous: "ctrl+shift+left", next: "ctrl+shift+right", newThread: "ctrl+n", mainThread: "ctrl+shift+1" };
 type Config = typeof defaults;
-type Thread = { slot: string; session: string; title: string; pid?: number; tty?: string; terminalId?: string; parent?: string; entry?: string; reservedAt?: number; kind?: "rpc" | "tui"; kickoff?: string; delegation?: string; working?: boolean; unread?: boolean; closed?: boolean; settledTurns?: number; lastSettledPid?: number; lastTurnAborted?: boolean; initialModel?: { provider: string; id: string; thinking: string } };
-type Group = { version: 1; root: string; threads: Thread[]; viewing?: string; wakeups?: ThreadWakeup[]; delegations?: ThreadDelegation[] };
+type Thread = { slot: string; session: string; title: string; pid?: number; tty?: string; terminalId?: string; parent?: string; entry?: string; reservedAt?: number; kind?: "rpc" | "tui"; kickoff?: string; delegation?: string; working?: boolean; unread?: boolean; closed?: boolean; settledTurns?: number; lastSettledPid?: number; lastTurnAborted?: boolean; followUpPid?: number; initialModel?: { provider: string; id: string; thinking: string } };
+type Group = { version: 1; root: string; threads: Thread[]; viewing?: string; wakeups?: ThreadWakeup[]; delegations?: ThreadDelegation[]; followUps?: ThreadFollowUp[] };
 type Target = { entry: string; boundary: string; title: string; slot: string };
 type TreePreview = (width: number, theme: ExtensionContext["ui"]["theme"]) => string[];
 type PendingTarget = Target & { preview: TreePreview };
@@ -88,10 +89,11 @@ function prune(g: Group) {
   for (const thread of g.threads) {
     if (thread.pid && !pidAlive(thread.pid)) {
       if (thread.working && g.viewing !== thread.session) thread.unread = true;
-      delete thread.pid; delete thread.tty; delete thread.terminalId; delete thread.working;
+      delete thread.pid; delete thread.tty; delete thread.terminalId; delete thread.working; delete thread.followUpPid;
     }
     if (thread.reservedAt && Date.now() - thread.reservedAt >= 120000) delete thread.reservedAt;
   }
+  pruneThreadFollowUps(g);
 }
 async function locked<T>(path: string, fn: (group: Group | undefined) => T): Promise<T> {
   ensureDir(dirname(path));
@@ -459,7 +461,7 @@ export default async function (pi: ExtensionAPI) {
         if (!slot) throw new Error("All thread slots are in use");
         me.slot = slot; delete me.closed;
       }
-      me.pid = process.pid; delete me.tty; delete me.terminalId; delete me.reservedAt;
+      me.pid = process.pid; me.followUpPid = process.pid; delete me.tty; delete me.terminalId; delete me.reservedAt;
       if (localWorking) me.working = true; else delete me.working;
       if (!childSocket) {
         const viewed = terminalFocused && visibleThreads(group).find(thread => thread.session === selectedSession);
@@ -469,6 +471,7 @@ export default async function (pi: ExtensionAPI) {
       writeGroup(path, group);
     });
     groupFile = path;
+    followUp.listen(path, ctx);
     refreshFooterSlots();
   }
   function hostClosed(ctx: ExtensionContext) {
@@ -1278,7 +1281,7 @@ export default async function (pi: ExtensionAPI) {
     }
   });
   pi.on("before_agent_start", event => {
-    event.systemPromptOptions.sections.pi_threads = "Pi Threads plugin may have threads work concurrently in the same working directory, this is by design. Use pi logs to understand any unexpected code changes and work around it. You're working with pretty smart agents, you'll all figure it out. For authorized follow-up after a thread settles, find pi_threads_wake with tool search.";
+    event.systemPromptOptions.sections.pi_threads = "Pi Threads plugin may have threads work concurrently in the same working directory, this is by design. Use pi logs to understand any unexpected code changes and work around it. You're working with pretty smart agents, you'll all figure it out. For authorized follow-up after a thread settles, find pi_threads_wake with tool search. If the user explicitly asks to send a message to an existing thread, use pi_threads_send with that slot; the user must approve the message. Do not use it for general agent-to-agent chat.";
   });
   pi.on("agent_start", (_event, ctx) => updateActivity(ctx, true));
   pi.on("agent_settled", (event, ctx) => updateActivity(ctx, false, event.aborted));
@@ -1391,7 +1394,7 @@ export default async function (pi: ExtensionAPI) {
         pending = undefined; refreshMode();
         return { consume: true };
       }
-      if (pending && matchesKey(data, "enter") && ctx.ui.getEditorText().startsWith("/") && !/^\/threads(?:\s|$)/.test(ctx.ui.getEditorText())) {
+      if (pending && matchesKey(data, "enter") && ctx.ui.getEditorText().startsWith("/") && !/^\/(?:threads|thread-send)(?:\s|$)/.test(ctx.ui.getEditorText())) {
         if (creating) return { consume: true };
         const text = ctx.ui.getEditorText();
         const target = pending;
@@ -1524,6 +1527,7 @@ export default async function (pi: ExtensionAPI) {
     }
   });
   pi.on("session_shutdown", async (event, ctx) => {
+    followUp.stop();
     pending = undefined; hideTargets(); focusGeneration++; restoreFooter(); unsubscribeInput?.();
     if (!childSocket) mux?.screenTransition?.cancel();
     if (startupPaintPatch) {
@@ -1556,7 +1560,8 @@ export default async function (pi: ExtensionAPI) {
           const me = group?.threads.find(t => t.session === session && t.pid === process.pid);
           if (me && group) {
             if (me.working && group.viewing !== session) me.unread = true;
-            delete me.pid; delete me.tty; delete me.working;
+            delete me.pid; delete me.tty; delete me.working; delete me.followUpPid;
+            pruneThreadFollowUps(group);
             if (!childSocket) delete group.viewing;
             writeGroup(path, group);
           }
@@ -1589,6 +1594,10 @@ export default async function (pi: ExtensionAPI) {
         threads: () => listThreads(ctx),
       });
     },
+  });
+  const followUp = registerThreadFollowUp(pi, {
+    groupPath: () => groupFile,
+    readGroup, locked, writeGroup, pidAlive,
   });
   registerThreadWake(pi, {
     groupPath: () => groupFile,
